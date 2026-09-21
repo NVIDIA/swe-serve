@@ -1,0 +1,2 @@
+test/registered/unit/spec/test_eagle_v2_worker_factory.py::test_eagle_family_uses_one_worker_across_overlap_modes
+test/registered/spec/eagle/test_eagle_v2_public_page_one.py::test_public_page_one_tree_runtime_matches_target

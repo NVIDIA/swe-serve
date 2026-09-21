@@ -1,0 +1,1 @@
+test/manual/layers/test_layernorm.py::TestGemmaRMSNorm::test_gemma_rms_norm

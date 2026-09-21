@@ -1,0 +1,1 @@
+test/registered/models/test_qwen35_moe_public_serving.py::test_native_generate_batch_logprobs_and_moe_routing

@@ -1,0 +1,4 @@
+test/registered/spec/test_ngram_speculative_decoding.py::TestNgramSpeculativeDecodingBase::test_gsm8k
+test/registered/spec/test_ngram_speculative_decoding.py::TestNgramSpeculativeDecodingTriton::test_gsm8k
+test/registered/spec/test_ngram_speculative_decoding.py::TestNgramSpeculativeDecodingFlashinfer::test_gsm8k
+test/registered/spec/test_ngram_speculative_decoding.py::TestNgramSpeculativeDecodingPaged::test_gsm8k

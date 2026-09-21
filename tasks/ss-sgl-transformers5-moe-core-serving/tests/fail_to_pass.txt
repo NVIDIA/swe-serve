@@ -1,0 +1,4 @@
+test/registered/models/test_transformers5_moe_serving.py::test_layer_a_authentic_moe_model_loads_with_recorder
+test/registered/models/test_transformers_models.py::TestTransformersFallbackEndpoint::test_mmlu
+test/registered/models/test_transformers_models.py::TestTransformersFallbackEndpoint::test_gsm8k
+test/manual/test_expert_distribution.py::TestExpertDistribution::test_expert_distribution_record

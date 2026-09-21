@@ -1,0 +1,6 @@
+test/registered/models/test_qwen35_public_serving.py::test_openai_chat_known_answers_are_correct
+test/registered/models/test_qwen35_public_serving.py::test_openai_video_request_identifies_semantic_color
+test/registered/vlm/test_vision_openai_server_a.py::TestQwen35DenseVLM::test_mixed_batch
+test/registered/vlm/test_vision_openai_server_a.py::TestQwen35DenseVLM::test_single_image_chat_completion
+test/registered/vlm/test_vision_openai_server_a.py::TestQwen35DenseVLM::test_multi_turn_chat_completion
+test/registered/vlm/test_vision_openai_server_a.py::TestQwen35DenseVLM::test_multi_images_chat_completion

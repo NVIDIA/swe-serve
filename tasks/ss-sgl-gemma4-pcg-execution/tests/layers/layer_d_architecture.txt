@@ -1,0 +1,1 @@
+test/registered/models/test_gemma4_pcg_execution.py::test_repeated_public_prefills_use_forced_pcg

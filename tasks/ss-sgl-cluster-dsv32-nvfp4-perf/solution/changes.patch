@@ -1,0 +1,222 @@
+diff --git a/python/sglang/srt/layers/quantization/modelopt_quant.py b/python/sglang/srt/layers/quantization/modelopt_quant.py
+index 01b2d38aaa..1d23c5f2cb 100755
+--- a/python/sglang/srt/layers/quantization/modelopt_quant.py
++++ b/python/sglang/srt/layers/quantization/modelopt_quant.py
+@@ -55,7 +55,7 @@ from sglang.srt.layers.quantization.utils import (
+     swizzle_blockscale,
+ )
+ from sglang.srt.layers.radix_attention import RadixAttention
+-from sglang.srt.layers.utils import copy_or_rebind_param
++from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+ from sglang.srt.utils.common import (
+     is_cuda,
+     is_sm120_supported,
+@@ -1361,7 +1361,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
+         input_scale_2 = layer.input_scale.max().to(torch.float32)
+         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+ 
+-        # Keep per-shard scales intact for hot reload; derive scalar params below.
++        # alpha / input_scale_inv stay as scalar Parameters. Aliasing them into
++        # the [N_partitions] source slot breaks fused-QKV linears whose
++        # downstream kernels assume scalar input scale.
+         copy_or_rebind_param(
+             layer, "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
+         )
+@@ -1418,7 +1420,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
+                 .view(torch.float8_e4m3fn)
+             )
+ 
+-            copy_or_rebind_param(layer, "weight_scale_interleaved", scale)
++            alias_or_bind_derived_param(
++                layer, "weight_scale", "weight_scale_interleaved", scale
++            )
+             copy_or_rebind_param(layer, "weight", weight)
+             layer.weights_padding_cols = weights_padding_cols
+             return
+@@ -1450,7 +1454,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
+             if scale_ndim == 2
+             else padded_scales.reshape(B, M_padded, K_padded)
+         )
+-        copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
++        alias_or_bind_derived_param(
++            layer, "weight_scale", "weight_scale_interleaved", padded_scales
++        )
+ 
+     def apply(
+         self,
+@@ -1700,7 +1706,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
+ 
+         Only supports pre-quantized checkpoints with FP8 weights and scales.
+         """
+-
+         # GEMM 1 scale processing
+         if layer.moe_runner_config.is_gated:
+             if layer.w13_weight_scale_2.dim() == 1:
+@@ -1825,6 +1830,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
+ 
+             # FlashInfer TRTLLM processing - handles both w13 and w2
+             align_fp4_moe_weights_for_flashinfer_trtllm(layer)
++            # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
++            # placeholders from create_weights.
++            layer.w13_blockscale_swizzled = layer.w13_weight_scale
++            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+ 
+         else:
+             # CUTLASS processing - handle w13 and w2 separately
+@@ -1853,8 +1862,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
+ 
+             # Process w13 weights
+             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
+-            copy_or_rebind_param(
+-                layer, "w13_blockscale_swizzled", w13_blockscale_swizzled
++            alias_or_bind_derived_param(
++                layer,
++                "w13_weight_scale",
++                "w13_blockscale_swizzled",
++                w13_blockscale_swizzled,
+             )
+ 
+             w13_weight = layer.w13_weight
+@@ -1891,8 +1903,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
+ 
+             # Process w2 weights
+             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
+-            copy_or_rebind_param(
+-                layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
++            alias_or_bind_derived_param(
++                layer,
++                "w2_weight_scale",
++                "w2_blockscale_swizzled",
++                w2_blockscale_swizzled,
+             )
+ 
+             if self._is_cutedsl_v2_standard:
+diff --git a/python/sglang/srt/layers/utils/common.py b/python/sglang/srt/layers/utils/common.py
+index 4c8080b0de..b72c3cef8e 100644
+--- a/python/sglang/srt/layers/utils/common.py
++++ b/python/sglang/srt/layers/utils/common.py
+@@ -69,6 +69,41 @@ def copy_or_rebind_param(
+         setattr(module, name, Parameter(new_value, requires_grad=False))
+ 
+ 
++def alias_or_bind_derived_param(
++    module: torch.nn.Module,
++    source_name: str,
++    derived_name: str,
++    derived_value: torch.Tensor,
++) -> None:
++    """Bind a post-processed (derived) tensor to a derived attribute name.
++
++    When `derived_value` is broadcastable to the source Parameter's shape (and
++    dtype matches), write it broadcast-filled into the source's storage in
++    place and register `derived_name` as an alias of the source Parameter. The
++    two attribute names then share one underlying buffer, so:
++      - apply() can read via `derived_name`
++      - update_weights_from_disk can keep refilling `source_name` (the loader
++        re-runs process_weights_after_loading which re-derives in place)
++      - peak GPU memory is the source size, not source + derived.
++
++    When the shapes are not broadcast-compatible, fall back to allocating a
++    separate Parameter under `derived_name` via copy_or_rebind_param.
++    """
++    derived_value = derived_value.detach()
++    source = getattr(module, source_name, None)
++    if isinstance(source, Parameter) and source.data.dtype == derived_value.dtype:
++        try:
++            broadcast = torch.broadcast_to(derived_value, source.data.shape)
++        except RuntimeError:
++            broadcast = None
++        if broadcast is not None:
++            source.data.copy_(broadcast)
++            source.requires_grad_(False)
++            setattr(module, derived_name, source)
++            return
++    copy_or_rebind_param(module, derived_name, derived_value)
++
++
+ class PPMissingLayer(torch.nn.Identity):
+     # Adapted from
+     # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 689cf9837b..44cd3ef01e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -3020,7 +3020,10 @@ class Scheduler(
+                     batch_result.copy_done = self.device_module.Event()
+                     if batch_result.delay_sample_func is None:
+                         self.future_map.store_to_map(future_indices, batch_result)
+-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
++                        batch_result.copy_to_cpu(
++                            return_logprob=batch.return_logprob,
++                            return_hidden_states=batch.return_hidden_states,
++                        )
+                     else:
+                         batch_result.future_indices = future_indices
+ 
+@@ -3125,7 +3128,10 @@ class Scheduler(
+             _batch_result = batch_result.delay_sample_func()
+             assert _batch_result is batch_result
+             self.future_map.store_to_map(batch_result.future_indices, batch_result)
+-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
++            batch_result.copy_to_cpu(
++                return_logprob=self.cur_batch.return_logprob,
++                return_hidden_states=self.cur_batch.return_hidden_states,
++            )
+ 
+         # Release the closure and large GPU tensors that are no longer needed.
+         # The delay_sample_func closure captures forward_batch (which holds
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index a277f9b795..1a7224a74d 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -59,7 +59,7 @@ class GenerationBatchResult:
+     fpm_start_event: Optional[torch.cuda.Event] = None
+     fpm_end_event: Optional[torch.cuda.Event] = None
+ 
+-    def copy_to_cpu(self, return_logprob: bool):
++    def copy_to_cpu(self, return_logprob: bool, return_hidden_states: bool = True):
+         """Copy tensors to CPU in overlap scheduling.
+         Only the tensors which are needed for processing results are copied,
+         e.g., next_token_ids, logits outputs
+@@ -88,7 +88,7 @@ class GenerationBatchResult:
+                     v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                     for v in self.logits_output.next_token_token_ids_logprobs_val
+                 ]
+-        if self.logits_output.hidden_states is not None:
++        if return_hidden_states and self.logits_output.hidden_states is not None:
+             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
+                 "cpu", non_blocking=True
+             )
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index cd02b9c0bb..e7cc629829 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -779,10 +779,9 @@ class DeepseekV2MoE(nn.Module):
+             if server_args.enable_eplb
+             else None
+         )
++        defer_shared = not self.experts.moe_runner_config.inplace
+         if hidden_states.shape[0] > 0:
+-            if (
+-                not self._fuse_shared_experts_inside_sbo
+-            ):  # TODO: check if it supports mtp
++            if not defer_shared and not self._fuse_shared_experts_inside_sbo:
+                 shared_output = self._forward_shared_experts(
+                     hidden_states, gemm_output_zero_allocator
+                 )
+@@ -847,6 +846,15 @@ class DeepseekV2MoE(nn.Module):
+             # fused in biased_grouped_topk so we can skip here
+             final_hidden_states *= self.routed_scaling_factor
+ 
++        if (
++            defer_shared
++            and hidden_states.shape[0] > 0
++            and not self._fuse_shared_experts_inside_sbo
++        ):
++            shared_output = self._forward_shared_experts(
++                hidden_states, gemm_output_zero_allocator
++            )
++
+         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+             self.experts,
+             final_hidden_states,

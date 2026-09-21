@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl27379-nvfp4-config-from-safetensors",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/27379"
+  ]
+}

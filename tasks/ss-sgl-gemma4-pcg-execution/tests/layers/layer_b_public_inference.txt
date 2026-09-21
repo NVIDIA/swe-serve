@@ -1,0 +1,1 @@
+test/registered/models/test_gemma4_pcg_execution.py::test_public_text_replays_with_logprob_parity

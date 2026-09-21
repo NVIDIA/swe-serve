@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# GPU overlay for Harbor's local Docker environment: attaches exactly one
+# NVIDIA GPU to the task service via the standard compose device reservation
+# (requires the NVIDIA Container Toolkit). Applied by gpu_env.py.
+#
+# Every GPU task in the roster declares [environment].gpus = 1, and several
+# verifiers assert that the container sees exactly that many devices. A
+# reservation of `all` hands a multi-GPU host's entire set to the container and
+# fails those tasks at verifier setup ("profile h100_1 requires 1 GPUs, got 2").
+services:
+  main:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

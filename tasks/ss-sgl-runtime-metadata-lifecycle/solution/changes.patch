@@ -1,0 +1,134 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index c76a86e15..abba37441 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1485,6 +1485,22 @@ class Scheduler(
+         with self.device_module.StreamContext(self.schedule_stream):
+             dispatch_event_loop(self)
+ 
++    def _apply_war_barrier(self):
++        # Wait for the prev forward to finish reading the shared buffers this
++        # iter's schedule will overwrite. Fast path: wait on the read-done event
++        # the forward published after its snapshot (non-spec: decode graph;
++        # spec: draft_extend), then clear it. Else fall back to whole-forward
++        # wait_stream.
++        if not self._war_barrier_enabled:
++            return
++        runner = self.model_worker.war_fastpath_runner
++        ev = runner.war_fastpath_read_done_event
++        if ev is not None:
++            self.schedule_stream.wait_event(ev)
++            runner.war_fastpath_read_done_event = None
++        else:
++            self.schedule_stream.wait_stream(self.forward_stream)
++
+     @DynamicGradMode()
+     def event_loop_normal(self):
+         """A normal scheduler loop."""
+@@ -1537,9 +1553,7 @@ class Scheduler(
+             if self._engine_paused:
+                 continue
+ 
+-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+-            if self._war_barrier_enabled:
+-                self.schedule_stream.wait_stream(self.forward_stream)
++            self._apply_war_barrier()
+ 
+             # Get the next batch to run
+             batch = self.get_next_batch_to_run()
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index d1654fe6a..2692ce002 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -70,6 +70,13 @@ class BaseTpWorker(ABC):
+     def model_runner(self) -> ModelRunner:
+         pass
+ 
++    @property
++    def war_fastpath_runner(self):
++        # The runner that runs the step's LAST shared-buffer-reading phase --
++        # it owns the read-done event the scheduler's WAR barrier waits on.
++        # For a plain worker that's its own runner.
++        return self.model_runner
++
+     @property
+     def sliding_window_size(self) -> Optional[int]:
+         return self.model_runner.sliding_window_size
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 3becbca04..f45f027d0 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -542,6 +542,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         # Init forward stream for overlap schedule
+         self.forward_stream = torch.get_device_module(self.device).Stream()
+ 
++        # WAR fast-path: a decode-graph forward publishes a fresh event here after
++        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
++        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
++        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
++
+         # CPU offload
+         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+ 
+diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
+index f70bd3e01..23deb34ba 100644
+--- a/python/sglang/srt/speculative/base_spec_worker.py
++++ b/python/sglang/srt/speculative/base_spec_worker.py
+@@ -282,6 +282,14 @@ class BaseSpecWorker(ABC):
+     def draft_worker(self) -> EagleDraftWorkerBase:
+         pass
+ 
++    @property
++    def war_fastpath_runner(self):
++        # The runner that runs the step's LAST shared-buffer-reading phase --
++        # it owns the read-done event the scheduler's WAR barrier waits on.
++        # Default is the target runner; override if the last phase runs
++        # elsewhere (eagle's draft_extend runs on the draft runner).
++        return self.target_worker.model_runner
++
+     @property
+     def spec_v2_attn_backends(self) -> tuple:
+         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.
+diff --git a/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py b/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+index 25aaa58bc..c755ea056 100644
+--- a/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
++++ b/python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py
+@@ -552,6 +552,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
+         )
+         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+ 
++        # Snapshot built -- the forward is done reading the shared pool. Publish
++        # a read-done event the scheduler's WAR barrier waits on.
++        read_done = self.device_module.Event()
++        read_done.record()
++        self.model_runner.war_fastpath_read_done_event = read_done
++
+         self.raw_bs = raw_bs
+         self.bs = bs
+         shape_key = self._make_graph_key(bs)
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 2a1951686..c31628d11 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -443,6 +443,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
+                 self.target_worker.device
+             ](self)
++            # draft_extend is the step's last shared-buffer-reading phase; its
++            # read-done event is what the scheduler's WAR barrier waits on.
+             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+             log_info_on_rank0(
+                 logger,
+@@ -975,6 +977,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
+ 
+         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+ 
++    @property
++    def war_fastpath_runner(self):
++        # Per the base contract: the step's last shared-buffer-reading phase is
++        # draft_extend, which runs on the draft runner.
++        return self._draft_worker.draft_runner
++
+     @property
+     def spec_v2_attn_backends(self) -> tuple:
+         # Every attn backend a spec_v2 forward touches; consumed by

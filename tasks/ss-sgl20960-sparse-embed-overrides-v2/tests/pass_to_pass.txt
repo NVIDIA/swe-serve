@@ -1,0 +1,2 @@
+test/registered/prefill_only/test_embed_overrides_e2e.py::TestEmbedOverridesHTTP::test_plain_score_baseline
+test/registered/prefill_only/test_embed_overrides_e2e.py::TestEmbedOverridesHTTP::test_identical_override_request_is_deterministic

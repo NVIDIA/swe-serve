@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl28371-chunked-sgmv-cuda-graph-replay",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/28371"
+  ]
+}

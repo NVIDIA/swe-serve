@@ -1,0 +1,6 @@
+/tests/postmerge_tests/test/registered/dllm/test_dllm_serving_radix_graph.py::test_legacy_low_confidence_single_block
+/tests/postmerge_tests/test/registered/dllm/test_dllm_serving_radix_graph.py::test_low_confidence_mask_free_fast_path
+/tests/postmerge_tests/test/registered/dllm/test_dllm_serving_radix_graph.py::test_disabled_diffusion_configuration_remains_none
+/tests/postmerge_tests/test/registered/dllm/test_dllm_serving_radix_graph.py::test_llada_defaults_and_low_confidence_identifier
+/tests/postmerge_tests/test/registered/dllm/test_dllm_serving_radix_graph.py::test_ordinary_ar_public_batch_generation
+/tests/postmerge_tests/test/registered/dllm/test_dllm_serving_radix_graph.py::test_ordinary_ar_public_prefix_cache_followup

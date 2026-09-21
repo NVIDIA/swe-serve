@@ -1,0 +1,3502 @@
+diff --git a/docs/advanced_features/server_arguments.md b/docs/advanced_features/server_arguments.md
+index 730a22745..46f5e712c 100644
+--- a/docs/advanced_features/server_arguments.md
++++ b/docs/advanced_features/server_arguments.md
+@@ -294,12 +294,10 @@ Please consult the documentation below and [server_args.py](https://github.com/s
+ ## Ngram speculative decoding
+ | Argument | Description | Defaults | Options |
+ | --- | --- | --- | --- |
+-| `--speculative-ngram-min-match-window-size` | The minimum window size for pattern matching in ngram speculative decoding. | `1` | Type: int |
+-| `--speculative-ngram-max-match-window-size` | The maximum window size for pattern matching in ngram speculative decoding. | `12` | Type: int |
+ | `--speculative-ngram-min-bfs-breadth` | The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `1` | Type: int |
+ | `--speculative-ngram-max-bfs-breadth` | The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding. | `10` | Type: int |
+-| `--speculative-ngram-match-type` | The match type for cache tree. | `BFS` | `BFS`, `PROB` |
+-| `--speculative-ngram-branch-length` | The branch length for ngram speculative decoding. | `18` | Type: int |
++| `--speculative-ngram-match-type` | Ngram tree-building mode. `BFS` selects recency-based expansion and `PROB` selects frequency-based expansion. This setting is forwarded to the ngram cache implementation. | `BFS` | `BFS`, `PROB` |
++| `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` | Type: int |
+ | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
+ 
+ ## Multi-layer Eagle speculative decoding
+diff --git a/docs/advanced_features/speculative_decoding.md b/docs/advanced_features/speculative_decoding.md
+index 121ae8d58..b8fe2d890 100644
+--- a/docs/advanced_features/speculative_decoding.md
++++ b/docs/advanced_features/speculative_decoding.md
+@@ -387,13 +387,11 @@ Enable it with:
+ 
+ | Parameter | Description | Default |
+ |---|---|---|
+-| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. If omitted, defaults to `--speculative-ngram-max-match-window-size`. | `12` (with default ngram settings) |
+-| `--speculative-ngram-min-match-window-size` | Minimum matching window size. | `1` |
+-| `--speculative-ngram-max-match-window-size` | Maximum matching window size. | `12` |
++| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. If omitted, defaults to `min(--speculative-ngram-max-trie-depth, 12)`. | `12` (with default ngram settings) |
+ | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
+ | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
+-| `--speculative-ngram-match-type` | Match type: `"BFS"` or `"PROB"`. | `"BFS"` |
+-| `--speculative-ngram-branch-length` | How many recent tokens to insert into the cache. | `18` |
++| `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
++| `--speculative-ngram-max-trie-depth` | Maximum suffix length stored and matched by the ngram trie. | `18` |
+ | `--speculative-ngram-capacity` | Cache capacity (number of entries). | `10,000,000` |
+ 
+ Notes:
+@@ -408,7 +406,6 @@ python3 -m sglang.launch_server \
+     --model Qwen/Qwen2.5-7B-Instruct \
+     --speculative-algorithm NGRAM \
+     --speculative-num-draft-tokens 16 \
+-    --speculative-ngram-max-match-window-size 12 \
+     --speculative-ngram-max-bfs-breadth 10 \
+     --mem-fraction-static 0.7 \
+     --cuda-graph-max-bs 8 \
+@@ -464,12 +461,10 @@ Below is a comprehensive list of all speculative decoding parameters available i
+ 
+ | Parameter | Type | Default | Description |
+ |---|---|---|---|
+-| `--speculative-ngram-min-match-window-size` | `int` | `1` | Minimum ngram matching window |
+-| `--speculative-ngram-max-match-window-size` | `int` | `12` | Maximum ngram matching window |
+ | `--speculative-ngram-min-bfs-breadth` | `int` | `1` | Minimum BFS breadth |
+ | `--speculative-ngram-max-bfs-breadth` | `int` | `10` | Maximum BFS breadth |
+-| `--speculative-ngram-match-type` | `str` | `"BFS"` | Match type: `"BFS"` or `"PROB"` |
+-| `--speculative-ngram-branch-length` | `int` | `18` | Recent tokens to insert into cache |
++| `--speculative-ngram-match-type` | `str` | `"BFS"` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion |
++| `--speculative-ngram-max-trie-depth` | `int` | `18` | Maximum suffix length stored and matched by the ngram trie |
+ | `--speculative-ngram-capacity` | `int` | `10,000,000` | Cache capacity |
+ 
+ ### Environment variables
+diff --git a/docs/platforms/ascend_npu_support_features.md b/docs/platforms/ascend_npu_support_features.md
+index 3297b6720..ee243b798 100644
+--- a/docs/platforms/ascend_npu_support_features.md
++++ b/docs/platforms/ascend_npu_support_features.md
+@@ -228,8 +228,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
+ | `--speculative-ngram-`<br/>`max-match-window-size` | `12`       | Type: int          |   Experimental   |
+ | `--speculative-ngram-`<br/>`min-bfs-breadth`       | `1`        | Type: int          |   Experimental   |
+ | `--speculative-ngram-`<br/>`max-bfs-breadth`       | `10`       | Type: int          |   Experimental   |
+-| `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental   |
+-| `--speculative-ngram-`<br/>`branch-length`         | `18`       | Type: int          |   Experimental   |
++| `--speculative-ngram-`<br/>`match-type`            | `BFS`      | `BFS`,<br/> `PROB` |   Experimental. `BFS` uses recency-based expansion; `PROB` uses frequency-based expansion. |
++| `--speculative-ngram-`<br/>`max-trie-depth`         | `18`       | Type: int          |   Experimental   |
+ | `--speculative-ngram-`<br/>`capacity`              | `10000000` | Type: int          |   Experimental   |
+ 
+ ## Expert parallelism
+diff --git a/python/sglang/jit_kernel/__main__.py b/python/sglang/jit_kernel/__main__.py
+index bacf4f84e..b626fde78 100644
+--- a/python/sglang/jit_kernel/__main__.py
++++ b/python/sglang/jit_kernel/__main__.py
+@@ -1,43 +1,91 @@
+-assert __name__ == "__main__"
+-
++import argparse
++import logging
++import os
+ 
+-def generate_clangd():
+-    import logging
+-    import os
+-    import subprocess
++from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
+ 
+-    from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
++from sglang.jit_kernel.utils import (
++    _REGISTERED_DEPENDENCIES,
++    DEFAULT_INCLUDE,
++    _get_default_target_flags,
++    get_jit_cuda_arch,
++    override_jit_cuda_arch,
++)
+ 
+-    from sglang.jit_kernel.utils import DEFAULT_INCLUDE
+ 
++def generate_clangd():
+     logger = logging.getLogger()
+-    logger.info("Generating .clangd file...")
+-    include_paths = [find_include_path(), find_dlpack_include_path()] + DEFAULT_INCLUDE
+-    status = subprocess.run(
+-        args=["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+-        capture_output=True,
+-        check=True,
++    parser = argparse.ArgumentParser(
++        description="Generate .clangd file for sglang jit kernel development."
++    )
++    parser.add_argument(
++        "--overwrite",
++        action="store_true",
++        help="Overwrite existing .clangd file if it exists.",
++    )
++    parser.add_argument(
++        "--dependencies",
++        "--dep",
++        nargs="*",
++        default=[],
++        choices=_REGISTERED_DEPENDENCIES.keys(),
++        help="Extra dependency libraries to include.",
+     )
+-    compute_cap = status.stdout.decode("utf-8").strip().split("\n")[0]
+-    major, minor = compute_cap.split(".")
+-    compile_flags = ",\n    ".join(
+-        [
+-            "-xcuda",
+-            f"--cuda-gpu-arch=sm_{major}{minor}",
+-            "-std=c++20",
+-            "-Wall",
+-            "-Wextra",
+-        ]
+-        + [f"-isystem{path}" for path in include_paths]
++    parser.add_argument(
++        "--cuda-target",
++        "--cuda",
++        default=None,
++        type=str,
++        help="Target architecture to generate compile flags for.",
+     )
++    args = parser.parse_args()
++
++    dep_include_paths = []
++    for dep in args.dependencies:
++        if dep not in _REGISTERED_DEPENDENCIES:
++            raise ValueError(f"Dependency {dep} is not registered.")
++        dep_include_paths += _REGISTERED_DEPENDENCIES[dep]()
++
++    include_paths = [
++        *DEFAULT_INCLUDE,
++        find_include_path(),
++        find_dlpack_include_path(),
++        *dep_include_paths,
++    ]
++    if args.cuda_target:
++        assert args.cuda_target.count(".") == 1
++        major, minor = args.cuda_target.split(".")
++        major, minor = int(major), int(minor)
++        context = override_jit_cuda_arch(major, minor)
++        context.__enter__()
++    else:
++        arch = get_jit_cuda_arch()
++        major, minor = arch.major, f"{arch.minor}{arch.suffix}"
++        assert (
++            major > 0
++        ), "Cannot detect CUDA architecture, please specify --cuda-target explicitly."
++
++    compile_flags = [
++        "-xcuda",
++        f"--cuda-gpu-arch=sm_{major}{minor}",
++        "-Wall",
++        "-Wextra",
++        *_get_default_target_flags(),
++        *[f"-isystem{path}" for path in include_paths],
++    ]
++    # NOTE: skip these flags because clangd don't recognize them
++    UNSUPPORTED_FLAGS = {"--expt-relaxed-constexpr"}
++    compile_flags = [flag for flag in compile_flags if flag not in UNSUPPORTED_FLAGS]
++    compile_flags_str = ",\n    ".join(compile_flags)
+     clangd_content = f"""
+ CompileFlags:
+   Add: [
+-    {compile_flags}
++    {compile_flags_str}
+   ]
+ """
+-    if os.path.exists(".clangd"):
++    if os.path.exists(".clangd") and not args.overwrite:
+         logger.warning(".clangd file already exists, nothing done.")
++        logger.warning("Use --overwrite to force overwrite the existing .clangd file.")
+         logger.warning(f"suggested content: {clangd_content}")
+     else:
+         with open(".clangd", "w") as f:
+@@ -45,4 +93,7 @@ CompileFlags:
+         logger.info(".clangd file generated.")
+ 
+ 
++assert __name__ == "__main__"
++
++logging.basicConfig(level=logging.INFO)
+ generate_clangd()
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp
+new file mode 100644
+index 000000000..c79d7cd7d
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp
+@@ -0,0 +1,153 @@
++#include "ngram.h"
++
++#include "trie.h"
++#include <limits>
++#include <stdexcept>
++#include <string>
++
++namespace ngram {
++
++Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
++  if (!(param_.max_trie_depth > 1)) {
++    throw std::runtime_error(
++        "param_.max_trie_depth must be greater than 1, current value: " + std::to_string(param_.max_trie_depth));
++  }
++  if (!(param_.min_bfs_breadth > 0)) {
++    throw std::runtime_error(
++        "min_bfs_breadth must be greater than 0, current value: " + std::to_string(param_.min_bfs_breadth));
++  }
++  if (!(param_.min_bfs_breadth <= param_.max_bfs_breadth)) {
++    throw std::runtime_error(
++        "min_bfs_breadth must be less than or equal to max_bfs_breadth, "
++        "current min_bfs_breadth: " +
++        std::to_string(param_.min_bfs_breadth) + ", max_bfs_breadth: " + std::to_string(param_.max_bfs_breadth));
++  }
++  if (!(param_.draft_token_num > 0)) {
++    throw std::runtime_error(
++        "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
++  }
++  for (auto config : param_.batch_draft_token_num) {
++    if (config != std::numeric_limits<decltype(config)>::max()) {
++      if (!(config <= param_.draft_token_num)) {
++        throw std::runtime_error(
++            "batch_draft_token_num config value " + std::to_string(config) +
++            " must be less than or equal to draft_token_num: " + std::to_string(param_.draft_token_num));
++      }
++    }
++  }
++
++  trie_ = std::make_unique<Trie>(capacity, param_);
++
++  insert_worker_ = std::thread(&Ngram::insertWorker, this);
++}
++
++Ngram::~Ngram() {
++  insert_queue_.close();
++  if (insert_worker_.joinable()) {
++    insert_worker_.join();
++  }
++}
++
++void Ngram::synchronize() const {
++  std::unique_lock<std::mutex> lock(mutex_);
++  sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
++}
++
++void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
++  {
++    std::lock_guard<std::mutex> lock(mutex_);
++    pending_count_ += tokens.size();
++  }
++  for (auto&& token : tokens) {
++    insert_queue_.enqueue(std::move(token));
++  }
++}
++
++void Ngram::insertWorker() {
++  for (;;) {
++    std::vector<int32_t> data;
++    if (!insert_queue_.dequeue(data)) {
++      break;
++    }
++    std::unique_lock<std::mutex> lock(mutex_);
++    trie_->insert(data.data(), data.size());
++    --pending_count_;
++    lock.unlock();
++    sync_cv_.notify_all();
++  }
++}
++
++Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) {
++  std::unique_lock<std::mutex> lock(mutex_);
++
++  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
++  BuildFn build_fn;
++  if (param_.match_type == "BFS") {
++    build_fn = &Trie::buildRecency;
++  } else if (param_.match_type == "PROB") {
++    build_fn = &Trie::buildFrequency;
++  } else {
++    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
++  }
++
++  Result merged;
++  for (size_t i = 0; i < tokens.size(); ++i) {
++    const auto& suffix = tokens[i];
++    if (suffix.empty()) {
++      throw std::runtime_error("batchMatch received an empty token tail");
++    }
++    MatchState temp_state;
++    auto draft_token_num = param_.get_draft_token_num(tokens.size());
++    auto res = (trie_.get()->*build_fn)(
++        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, temp_state, suffix.size());
++    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
++    merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
++  }
++  return merged;
++}
++
++Result Ngram::batchMatch(
++    const std::vector<int64_t>& state_ids,
++    const std::vector<std::vector<int32_t>>& tokens,
++    const std::vector<size_t>& total_lens) {
++  if (state_ids.size() != tokens.size() || state_ids.size() != total_lens.size()) {
++    throw std::runtime_error("batchMatch expects state_ids, tokens, and total_lens to match in size");
++  }
++
++  std::unique_lock<std::mutex> lock(mutex_);
++
++  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
++  BuildFn build_fn;
++  if (param_.match_type == "BFS") {
++    build_fn = &Trie::buildRecency;
++  } else if (param_.match_type == "PROB") {
++    build_fn = &Trie::buildFrequency;
++  } else {
++    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
++  }
++
++  Result merged;
++  for (size_t i = 0; i < state_ids.size(); ++i) {
++    const auto& suffix = tokens[i];
++    if (suffix.empty()) {
++      throw std::runtime_error("batchMatch received an empty token tail");
++    }
++
++    auto& state = match_state_[state_ids[i]];
++    auto draft_token_num = param_.get_draft_token_num(tokens.size());
++    auto res = (trie_.get()->*build_fn)(
++        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, state, total_lens[i]);
++    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
++    merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
++  }
++  return merged;
++}
++
++void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  for (const auto& sid : state_ids) {
++    match_state_.erase(sid);
++  }
++}
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h
+new file mode 100644
+index 000000000..d1b404974
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h
+@@ -0,0 +1,68 @@
++#pragma once
++
++#include "param.h"
++#include "queue.h"
++#include "result.h"
++#include "trie.h"
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++namespace ngram {
++
++class Ngram {
++  std::unique_ptr<Trie> trie_;
++  Param param_;
++
++  // NOTE: protects trie_ and pending_count_. Ensures batchMatch never reads
++  // trie_ while insertWorker is writing. After synchronize(), no pending
++  // inserts remain so mutex_ contention is effectively zero.
++  mutable std::mutex mutex_;
++  mutable std::condition_variable sync_cv_;
++  // NOTE: tracks inserts from enqueue through trie_->insert() completion,
++  // not just queue occupancy. A dequeued item may still be mid-insert.
++  size_t pending_count_ = 0;
++  utils::Queue<std::vector<int32_t>> insert_queue_;
++  std::thread insert_worker_;
++  std::unordered_map<int64_t, MatchState> match_state_;
++
++ public:
++  Ngram(size_t capacity, const Param& param);
++  ~Ngram();
++
++  void synchronize() const;
++
++  void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
++
++  Result batchMatch(const std::vector<std::vector<int32_t>>& tokens);
++
++  Result batchMatch(
++      const std::vector<int64_t>& state_ids,
++      const std::vector<std::vector<int32_t>>& tokens,
++      const std::vector<size_t>& total_lens);
++
++  void eraseMatchState(const std::vector<int64_t>& state_ids);
++
++  void reset() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    if (trie_) {
++      trie_->reset();
++    }
++    match_state_.clear();
++  }
++
++  const Param& param() const {
++    return param_;
++  }
++
++ private:
++  void insertWorker();
++};
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp
+new file mode 100644
+index 000000000..bbd815c51
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp
+@@ -0,0 +1,142 @@
++#pragma once
++
++#include <sgl_kernel/ffi.h>
++#include <sgl_kernel/tensor.h>
++
++#include <tvm/ffi/reflection/registry.h>
++
++#include "ngram.h"
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++struct NgramCorpusObj : public tvm::ffi::Object {
++ public:
++  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.NgramCorpus", NgramCorpusObj, tvm::ffi::Object);
++  static constexpr bool _type_mutable = true;
++
++  NgramCorpusObj(
++      int64_t capacity,
++      int64_t max_trie_depth,
++      int64_t min_bfs_breadth,
++      int64_t max_bfs_breadth,
++      int64_t draft_token_num,
++      int64_t match_type) {
++    ngram::Param param;
++    param.enable = true;
++    param.enable_router_mode = false;
++    param.max_trie_depth = static_cast<size_t>(max_trie_depth);
++    param.min_bfs_breadth = static_cast<size_t>(min_bfs_breadth);
++    param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
++    param.draft_token_num = static_cast<size_t>(draft_token_num);
++    param.match_type = (match_type == 0) ? "BFS" : "PROB";
++    ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
++  }
++
++  void async_insert(const tvm::ffi::TensorView tokens_flat, const tvm::ffi::TensorView offsets) {
++    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
++    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
++    int64_t batch_size = offsets.size(0) - 1;
++
++    std::vector<std::vector<int32_t>> tokens(batch_size);
++    for (int64_t i = 0; i < batch_size; ++i) {
++      tokens[i].assign(data + offs[i], data + offs[i + 1]);
++    }
++    ngram_->asyncInsert(std::move(tokens));
++  }
++
++  void batch_match(
++      const tvm::ffi::TensorView tokens_flat,
++      const tvm::ffi::TensorView offsets,
++      const tvm::ffi::TensorView out_tokens,
++      const tvm::ffi::TensorView out_mask) {
++    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
++    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
++    int64_t batch_size = offsets.size(0) - 1;
++
++    std::vector<std::vector<int32_t>> tokens(batch_size);
++    for (int64_t i = 0; i < batch_size; ++i) {
++      tokens[i].assign(data + offs[i], data + offs[i + 1]);
++    }
++
++    auto result = ngram_->batchMatch(tokens);
++    write_result_(result, out_tokens, out_mask);
++  }
++
++  void batch_match_stateful(
++      const tvm::ffi::TensorView state_ids_tv,
++      const tvm::ffi::TensorView tokens_flat,
++      const tvm::ffi::TensorView offsets,
++      const tvm::ffi::TensorView total_lens_tv,
++      const tvm::ffi::TensorView out_tokens,
++      const tvm::ffi::TensorView out_mask) {
++    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
++    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
++    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
++    auto* tlens = static_cast<const int64_t*>(total_lens_tv.data_ptr());
++    int64_t batch_size = offsets.size(0) - 1;
++
++    std::vector<int64_t> state_ids(sid, sid + batch_size);
++    std::vector<std::vector<int32_t>> tokens(batch_size);
++    std::vector<size_t> total_lens(batch_size);
++    for (int64_t i = 0; i < batch_size; ++i) {
++      tokens[i].assign(data + offs[i], data + offs[i + 1]);
++      total_lens[i] = static_cast<size_t>(tlens[i]);
++    }
++
++    auto result = ngram_->batchMatch(state_ids, tokens, total_lens);
++    write_result_(result, out_tokens, out_mask);
++  }
++
++  void erase_match_state(const tvm::ffi::TensorView state_ids_tv) {
++    auto* sid = static_cast<const int64_t*>(state_ids_tv.data_ptr());
++    int64_t n = state_ids_tv.size(0);
++    std::vector<int64_t> state_ids(sid, sid + n);
++    ngram_->eraseMatchState(state_ids);
++  }
++
++  void synchronize() {
++    ngram_->synchronize();
++  }
++
++  void reset() {
++    ngram_->reset();
++  }
++
++ private:
++  void write_result_(
++      const ngram::Result& result, const tvm::ffi::TensorView& out_tokens, const tvm::ffi::TensorView& out_mask) {
++    auto* out_tok = static_cast<int32_t*>(out_tokens.data_ptr());
++    auto* out_msk = static_cast<uint8_t*>(out_mask.data_ptr());
++    if (result.token.size() > static_cast<size_t>(out_tokens.size(0))) {
++      throw std::runtime_error(
++          "out_tokens buffer too small: " + std::to_string(out_tokens.size(0)) + " < " +
++          std::to_string(result.token.size()));
++    }
++    if (result.mask.size() > static_cast<size_t>(out_mask.size(0))) {
++      throw std::runtime_error(
++          "out_mask buffer too small: " + std::to_string(out_mask.size(0)) + " < " +
++          std::to_string(result.mask.size()));
++    }
++    std::memcpy(out_tok, result.token.data(), result.token.size() * sizeof(int32_t));
++    std::memcpy(out_msk, result.mask.data(), result.mask.size() * sizeof(uint8_t));
++  }
++
++  std::unique_ptr<ngram::Ngram> ngram_;
++};
++
++void register_ngram_corpus() {
++  namespace refl = tvm::ffi::reflection;
++  refl::ObjectDef<NgramCorpusObj>()
++      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
++      .def("async_insert", &NgramCorpusObj::async_insert)
++      .def("batch_match", &NgramCorpusObj::batch_match)
++      .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
++      .def("erase_match_state", &NgramCorpusObj::erase_match_state)
++      .def("synchronize", &NgramCorpusObj::synchronize)
++      .def("reset", &NgramCorpusObj::reset);
++}
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(register_once, register_ngram_corpus);
+diff --git a/python/sglang/srt/speculative/cpp_ngram/param.h b/python/sglang/jit_kernel/csrc/ngram_corpus/param.h
+similarity index 75%
+rename from python/sglang/srt/speculative/cpp_ngram/param.h
+rename to python/sglang/jit_kernel/csrc/ngram_corpus/param.h
+index 08b975bb1..725f635db 100644
+--- a/python/sglang/srt/speculative/cpp_ngram/param.h
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/param.h
+@@ -17,13 +17,10 @@ struct Param {
+   bool enable_router_mode;
+   size_t min_bfs_breadth;
+   size_t max_bfs_breadth;
+-  size_t min_match_window_size;
+-  size_t max_match_window_size;
+-  size_t branch_length;
++  size_t max_trie_depth;
+   size_t draft_token_num;
+   std::string match_type;
+ 
+-  std::vector<size_t> batch_min_match_window_size;
+   std::vector<size_t> batch_draft_token_num;
+ 
+   size_t get_draft_token_num(size_t batch_size) const {
+@@ -36,16 +33,6 @@ struct Param {
+     return draft_token_num - 1;
+   }
+ 
+-  size_t get_min_match_window_size(size_t batch_size) const {
+-    if (batch_size < batch_min_match_window_size.size()) {
+-      if (batch_min_match_window_size[batch_size] !=
+-          std::numeric_limits<decltype(batch_min_match_window_size)::value_type>::max()) {
+-        return batch_min_match_window_size[batch_size];
+-      }
+-    }
+-    return min_match_window_size;
+-  }
+-
+   std::vector<size_t> parse(const std::string& value) {
+     // 0-1|10,2-3|20,
+     std::vector<size_t> result;
+@@ -96,10 +83,6 @@ struct Param {
+     return result;
+   }
+ 
+-  void resetBatchMinMatchWindowSize(const std::string& value) {
+-    batch_min_match_window_size = parse(value);
+-  }
+-
+   void resetBatchReturnTokenNum(const std::string& value) {
+     batch_draft_token_num = parse(value);
+   }
+@@ -108,13 +91,8 @@ struct Param {
+     std::stringstream ss;
+     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
+        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
+-       << ", min_match_window_size = " << min_match_window_size << ", max_match_window_size = " << max_match_window_size
+-       << ", branch_length = " << branch_length << ", draft_token_num = " << draft_token_num
++       << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
+        << ", match_type = " << match_type;
+-    ss << ", batch_min_match_window_size(" << batch_min_match_window_size.size() << ") = ";
+-    for (int i = 0; i < batch_min_match_window_size.size(); ++i) {
+-      ss << i << "|" << batch_min_match_window_size[i] << ",";
+-    }
+     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
+     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
+       ss << i << "|" << batch_draft_token_num[i] << ",";
+diff --git a/python/sglang/srt/speculative/cpp_ngram/queue.h b/python/sglang/jit_kernel/csrc/ngram_corpus/queue.h
+similarity index 100%
+rename from python/sglang/srt/speculative/cpp_ngram/queue.h
+rename to python/sglang/jit_kernel/csrc/ngram_corpus/queue.h
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp
+new file mode 100644
+index 000000000..404b7a3f2
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp
+@@ -0,0 +1,61 @@
++#include "result.h"
++
++#include <cstring>
++#include <queue>
++#include <tuple>
++
++namespace ngram {
++
++Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
++  Result info;
++  std::vector<int32_t> prevs;
++  info.token.reserve(draft_token_num);
++  prevs.reserve(draft_token_num);
++  std::queue<std::tuple<int32_t, int32_t, int32_t>> queue;
++  info.token.emplace_back(last_token);
++  prevs.emplace_back(-1);
++
++  for (auto [token, next] : tree[root].next) {
++    queue.emplace(token, next, 0);
++  }
++  while (queue.size()) {
++    auto [token, next, prev] = queue.front();
++    queue.pop();
++    info.token.emplace_back(token);
++    prevs.emplace_back(prev);
++    for (auto [t, n] : tree[next].next) {
++      queue.emplace(t, n, info.token.size() - 1);
++    }
++  }
++
++  // zero padding to length
++  while (info.token.size() < static_cast<size_t>(draft_token_num)) {
++    info.token.emplace_back(0);
++    prevs.emplace_back(0);
++  }
++
++  int n = info.token.size();
++  info.mask.resize(n * n, 0);
++  info.mask[0] = 1;
++  for (int i = 0; i < n; ++i) {
++    if (prevs[i] != -1) {
++      memcpy(&info.mask[i * n], &info.mask[prevs[i] * n], prevs[i] + 1);
++    }
++    info.mask[i * n + i] = 1;
++  }
++
++  return info;
++}
++
++void Result::truncate(size_t n) {
++  if (n < token.size()) {
++    int full_n = token.size();
++    for (size_t i = 1; i < n; ++i) {
++      memcpy(&mask[i * n], &mask[i * full_n], sizeof(mask[0]) * n);
++    }
++    token.resize(n);
++    mask.resize(n * n);
++  }
++}
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/result.h b/python/sglang/jit_kernel/csrc/ngram_corpus/result.h
+new file mode 100644
+index 000000000..c48351d77
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/result.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <cstdint>
++#include <unordered_map>
++#include <vector>
++
++namespace ngram {
++
++struct Result {
++  std::vector<int32_t> token;
++  std::vector<uint8_t> mask;
++
++  void truncate(size_t n);
++};
++
++struct Node {
++  std::unordered_map<int32_t, int32_t> next;
++};
++
++Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root);
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/trie.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/trie.cpp
+new file mode 100644
+index 000000000..a429a5576
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/trie.cpp
+@@ -0,0 +1,328 @@
++#include "trie.h"
++
++#include <algorithm>
++#include <cstring>
++#include <list>
++#include <queue>
++#include <tuple>
++#include <vector>
++
++namespace ngram {
++
++Trie::Trie(size_t capacity, const Param& param) : param_(param) {
++  nodes_.resize(capacity);
++  for (auto& node : nodes_) {
++    node_pool_.emplace_back(&node);
++  }
++  free_node_count_ = node_pool_.size();
++  root_ = getNode();
++}
++
++void Trie::insert(const int32_t* tokens, size_t len) {
++  for (size_t i = 0; i < len; ++i) {
++    auto start = tokens + i;
++    auto end = start + std::min(len - i, param_.max_trie_depth);
++
++    if (static_cast<size_t>(end - start) > free_node_count_) {
++      squeeze(end - start - free_node_count_);
++    }
++
++    TrieNode* cursor = root_;
++    path_.clear();
++    while (start != end) {
++      auto token = *start;
++      auto iter = cursor->child.find(token);
++      if (iter == cursor->child.end()) {
++        iter = cursor->child.insert({token, getNode()}).first;
++        auto node = iter->second;
++
++        cursor->lru.emplace_front(node);
++        global_lru_.emplace_back(node);
++
++        node->token = token;
++        node->parent = cursor;
++        node->parent_lru_pos = cursor->lru.begin();
++        node->global_lru_pos = --global_lru_.end();
++        node->freq = 1;
++        cursor->sorted_children.insert(node);
++      } else {
++        auto node = iter->second;
++        cursor->sorted_children.erase(node);
++        node->freq++;
++        cursor->sorted_children.insert(node);
++        cursor->lru.splice(cursor->lru.begin(), cursor->lru, node->parent_lru_pos);
++      }
++      cursor = iter->second;
++      path_.emplace_back(cursor);
++      ++start;
++    }
++
++    for (auto it = path_.rbegin(); it != path_.rend(); ++it) {
++      TrieNode* node = *it;
++      global_lru_.splice(global_lru_.begin(), global_lru_, node->global_lru_pos);
++    }
++  }
++}
++
++void Trie::squeeze(size_t count) {
++  if (!(node_pool_.size() >= free_node_count_ + count)) {
++    throw std::runtime_error(
++        "Insufficient node size to release required nodes. "
++        "available to release: " +
++        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
++  }
++  while (count--) {
++    auto last = global_lru_.back();
++    global_lru_.pop_back();
++
++    if (!last->child.empty()) {
++      throw std::runtime_error(
++          "The node to be released still has child nodes and cannot be "
++          "released. ");
++    }
++
++    last->parent->lru.erase(last->parent_lru_pos);
++    last->parent->sorted_children.erase(last);
++    last->parent->child.erase(last->token);
++    retireNode(last);
++
++    node_pool_[free_node_count_++] = last;
++  }
++}
++
++void Trie::reset() {
++  ++trie_epoch_;
++  global_lru_.clear();
++  path_.clear();
++  node_pool_.clear();
++  for (auto& node : nodes_) {
++    node_pool_.emplace_back(&node);
++  }
++  free_node_count_ = node_pool_.size();
++  root_ = getNode();
++}
++
++const TrieNode* Trie::resolve(const MatchState& state, const NodeRef& ref) const {
++  if (ref.ptr == nullptr || state.trie_epoch != trie_epoch_ || ref.ptr->version != ref.version) {
++    return nullptr;
++  }
++  return ref.ptr;
++}
++
++bool Trie::validateMatchState_(const MatchState& state) const {
++  if (state.trie_epoch != trie_epoch_) {
++    return false;
++  }
++  for (const auto& ref : state.anchors) {
++    if (ref.ptr && !resolve(state, ref)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++void Trie::rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
++  const auto max_match_depth = std::min(len, param_.max_trie_depth);
++  state.trie_epoch = trie_epoch_;
++  state.processed_total_len = total_len;
++  state.anchors.assign(max_match_depth, {});
++  for (size_t match_depth = 1; match_depth <= max_match_depth; ++match_depth) {
++    auto start = context + len - match_depth;
++    auto end = start + match_depth;
++    auto cursor = root_;
++    while (start != end) {
++      auto iter = cursor->child.find(*start);
++      if (iter == cursor->child.end()) {
++        cursor = nullptr;
++        break;
++      }
++      ++start;
++      cursor = iter->second;
++    }
++    if (cursor != nullptr) {
++      state.anchors[match_depth - 1] = capture(cursor);
++    }
++  }
++}
++
++bool Trie::advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const {
++  if (!validateMatchState_(state)) {
++    return false;
++  }
++
++  for (size_t i = 0; i < len; ++i) {
++    const auto next_depth = std::min(state.anchors.size() + 1, param_.max_trie_depth);
++    std::vector<NodeRef> next(next_depth);
++
++    const auto root_ref = rootRef();
++    const auto root = resolve(state, root_ref);
++    if (root == nullptr) {
++      return false;
++    }
++    if (auto iter = root->child.find(tokens[i]); iter != root->child.end()) {
++      next[0] = capture(iter->second);
++    }
++
++    for (size_t depth = 1; depth < next_depth; ++depth) {
++      const auto& prev_ref = state.anchors[depth - 1];
++      if (prev_ref.ptr == nullptr) {
++        continue;
++      }
++      const auto prev_node = resolve(state, prev_ref);
++      if (prev_node == nullptr) {
++        return false;
++      }
++      if (auto iter = prev_node->child.find(tokens[i]); iter != prev_node->child.end()) {
++        next[depth] = capture(iter->second);
++      }
++    }
++
++    state.anchors.swap(next);
++  }
++
++  state.processed_total_len = total_len;
++  return true;
++}
++
++std::vector<std::pair<const TrieNode*, int32_t>> Trie::getExpandableAnchors_(const MatchState& state) const {
++  std::vector<std::pair<const TrieNode*, int32_t>> result;
++  result.reserve(state.anchors.size());
++  for (size_t depth = state.anchors.size(); depth > 0; --depth) {
++    const auto node = resolve(state, state.anchors[depth - 1]);
++    if (node != nullptr && !node->child.empty()) {
++      result.emplace_back(node, static_cast<int32_t>(depth));
++    }
++  }
++  return result;
++}
++
++std::vector<std::pair<const TrieNode*, int32_t>>
++Trie::match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const {
++  const bool has_forward_progress = total_len >= state.processed_total_len;
++  const auto appended_len = has_forward_progress ? total_len - state.processed_total_len : 0;
++  const auto expected_prev_depth = std::min(state.processed_total_len, param_.max_trie_depth);
++  const bool can_advance = state.trie_epoch == trie_epoch_ && has_forward_progress && appended_len <= len &&
++                           state.anchors.size() == expected_prev_depth;
++
++  if (can_advance && advanceMatchState_(state, context + len - appended_len, appended_len, total_len)) {
++    return getExpandableAnchors_(state);
++  }
++
++  rebuildMatchState_(context, len, state, total_len);
++  return getExpandableAnchors_(state);
++}
++
++Result Trie::buildRecency(
++    const int32_t* context,
++    size_t len,
++    int32_t last_token,
++    size_t draft_token_num,
++    const Param& param,
++    MatchState& state,
++    size_t total_len) const {
++  auto anchors = match(context, len, state, total_len);
++  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
++  double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
++
++  std::vector<Node> tree(draft_token_num + 1);
++  int root = 0;
++  int cursor = 1;
++
++  for (auto [node, depth] : anchors) {
++    std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
++    queue.push({root, (max_match_depth - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
++    while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
++      auto front = queue.front();
++      queue.pop();
++
++      auto parent = std::get<0>(front);
++      auto cur_breadth = std::get<1>(front);
++      auto iter = std::get<2>(front)->lru.begin();
++
++      auto breadth = std::max(1, int32_t(cur_breadth));
++      for (int i = 0;
++           i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= static_cast<int>(draft_token_num);
++           ++i, ++iter) {
++        auto token = (*iter)->token;
++        auto pos = -1;
++        if (auto tit = tree[parent].next.find(token); tit != tree[parent].next.end()) {
++          pos = tit->second;
++        } else {
++          pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
++        }
++        queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
++      }
++    }
++  }
++
++  return fillResult(last_token, draft_token_num + 1, tree, root);
++}
++
++Result Trie::buildFrequency(
++    const int32_t* context,
++    size_t len,
++    int32_t last_token,
++    size_t draft_token_num,
++    const Param& param,
++    MatchState& state,
++    size_t total_len) const {
++  auto anchors = match(context, len, state, total_len);
++  struct CompareByLastDouble {
++    bool operator()(
++        const std::tuple<double, const TrieNode*, double>& a,
++        const std::tuple<double, const TrieNode*, double>& b) const {
++      return std::get<2>(a) < std::get<2>(b);
++    }
++  };
++
++  std::priority_queue<
++      std::tuple<double, const TrieNode*, double>,
++      std::vector<std::tuple<double, const TrieNode*, double>>,
++      CompareByLastDouble>
++      heap;
++
++  std::vector<Node> tree(draft_token_num + 1);
++
++  int root = 0;
++  int cursor = 1;
++  int top_k = param.max_bfs_breadth;
++
++  auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node, double prob) -> void {
++    double sum_freq = 0.0;
++    int count = 0;
++    std::list<std::pair<TrieNode*, int32_t>> topk_children;
++    for (auto* child : trie_node->sorted_children) {
++      sum_freq += static_cast<double>(child->freq);
++      topk_children.emplace_back(child, child->freq);
++      if (++count >= top_k) break;
++    }
++    if (sum_freq <= 0) sum_freq = 1.0;
++    for (const auto& [child, freq] : topk_children) {
++      double norm_freq = static_cast<double>(freq) / sum_freq * prob;
++      heap.emplace(parent, child, norm_freq);
++    }
++  };
++
++  for (auto [node, _] : anchors) {
++    addToHeap(root, node, 1.0);
++
++    while (!heap.empty() && cursor <= static_cast<int>(draft_token_num)) {
++      auto [parent, trie_node, prob] = heap.top();
++      heap.pop();
++      auto token = trie_node->token;
++      int pos = -1;
++      auto tit = tree[parent].next.find(token);
++      if (tit != tree[parent].next.end()) {
++        pos = tit->second;
++      } else {
++        pos = cursor++;
++        tree[parent].next[token] = pos;
++      }
++      addToHeap(pos, trie_node, prob);
++    }
++  }
++
++  return fillResult(last_token, draft_token_num + 1, tree, root);
++}
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/trie.h b/python/sglang/jit_kernel/csrc/ngram_corpus/trie.h
+new file mode 100644
+index 000000000..909ffae8f
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/trie.h
+@@ -0,0 +1,140 @@
++#pragma once
++
++#include "param.h"
++#include "result.h"
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <list>
++#include <new>
++#include <set>
++#include <tuple>
++#include <unordered_map>
++#include <vector>
++
++namespace ngram {
++
++struct TrieNode {
++  std::unordered_map<int32_t, TrieNode*> child;
++  std::list<TrieNode*>::const_iterator global_lru_pos;
++  std::list<TrieNode*>::const_iterator parent_lru_pos;
++  int32_t token;
++  TrieNode* parent;
++  std::list<TrieNode*> lru;
++  int32_t freq = 0;
++  // Logical generation of this TrieNode. retireNode() bumps it before the node
++  // goes back to the pool so stale NodeRefs fail validation after reuse.
++  uint64_t version = 1;
++
++  struct CompareByFreq {
++    bool operator()(TrieNode* a, TrieNode* b) const {
++      return std::tie(b->freq, a->token, a) < std::tie(a->freq, b->token, b);
++    }
++  };
++  std::multiset<TrieNode*, CompareByFreq> sorted_children;
++};
++
++// By-value handle to a logical trie location, cached in MatchState.
++// We cannot cache TrieNode* alone across decode steps: squeeze() may evict a
++// node, and getNode() may later recycle the same address for a different node.
++struct NodeRef {
++  TrieNode* ptr = nullptr;
++  uint64_t version = 0;
++};
++
++// Per-request cached anchors. anchors[d - 1] caches the trie match for the
++// length-d suffix ending at the current last token; processed_total_len records
++// the full request length covered by those cached anchors.
++struct MatchState {
++  uint64_t trie_epoch = 0;
++  size_t processed_total_len = 0;
++  std::vector<NodeRef> anchors;
++};
++
++class Trie {
++ public:
++  Trie(size_t capacity, const Param& param);
++
++  void insert(const int32_t* tokens, size_t len);
++
++  Result buildRecency(
++      const int32_t* context,
++      size_t len,
++      int32_t last_token,
++      size_t draft_token_num,
++      const Param& param,
++      MatchState& state,
++      size_t total_len) const;
++
++  Result buildFrequency(
++      const int32_t* context,
++      size_t len,
++      int32_t last_token,
++      size_t draft_token_num,
++      const Param& param,
++      MatchState& state,
++      size_t total_len) const;
++
++  void squeeze(size_t count);
++
++  void reset();
++
++ private:
++  // Stateful suffix matcher. If `state` still represents the previous step for
++  // this request, infer the newly appended suffix from (`context`, `total_len`)
++  // and advance anchors incrementally; otherwise rebuild the cached anchors from
++  // `context`. Returns only the suffix matches that are currently expandable.
++  std::vector<std::pair<const TrieNode*, int32_t>>
++  match(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
++  // Recompute all cached anchors from the current tail. After this, for every
++  // d in [1, min(len, max_trie_depth)], anchors[d - 1] represents the suffix of
++  // length d ending at context[len - 1].
++  void rebuildMatchState_(const int32_t* context, size_t len, MatchState& state, size_t total_len) const;
++  // Advance the cached anchors by consuming the newly appended suffix one
++  // token at a time, without re-walking all suffixes from root.
++  bool advanceMatchState_(MatchState& state, const int32_t* tokens, size_t len, size_t total_len) const;
++  // Check that every non-empty cached NodeRef in MatchState still resolves to
++  // the same logical trie node under the current trie_epoch_.
++  bool validateMatchState_(const MatchState& state) const;
++  // MatchState keeps all live suffix matches, including leaves. This helper
++  // filters the cached anchors down to the suffixes that currently have children and
++  // therefore can seed BFS / PROB draft construction.
++  std::vector<std::pair<const TrieNode*, int32_t>> getExpandableAnchors_(const MatchState& state) const;
++  // Resolve a cached NodeRef back to a live trie node. nullptr means the
++  // cached location went stale and the caller should rebuild from context.
++  const TrieNode* resolve(const MatchState& state, const NodeRef& ref) const;
++  NodeRef rootRef() const {
++    return NodeRef{root_, root_->version};
++  }
++  NodeRef capture(TrieNode* node) const {
++    if (node == nullptr) {
++      return {};
++    }
++    return NodeRef{node, node->version};
++  }
++  void retireNode(TrieNode* node) {
++    if (node != nullptr) {
++      ++node->version;
++    }
++  }
++
++  TrieNode* getNode() {
++    auto node = node_pool_[--free_node_count_];
++    auto version = node->version;
++    node->~TrieNode();
++    new (node) TrieNode();
++    node->version = version;
++    return node;
++  }
++
++  std::vector<TrieNode> nodes_;
++  std::vector<TrieNode*> node_pool_;
++  size_t free_node_count_;
++  std::list<TrieNode*> global_lru_;
++  TrieNode* root_;
++  std::vector<TrieNode*> path_;
++  Param param_;
++  uint64_t trie_epoch_ = 1;
++};
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/ngram_corpus.py b/python/sglang/jit_kernel/ngram_corpus.py
+new file mode 100644
+index 000000000..2182c5c34
+--- /dev/null
++++ b/python/sglang/jit_kernel/ngram_corpus.py
+@@ -0,0 +1,115 @@
++from __future__ import annotations
++
++from typing import List, Tuple
++
++import numpy as np
++import torch
++import tvm_ffi
++
++from sglang.jit_kernel.utils import cache_once, load_jit
++
++_MATCH_TYPE_MAP = {"BFS": 0, "PROB": 1}
++
++
++def _to_csr(batch_tokens: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
++    flat = []
++    offsets = [0]
++    for seq in batch_tokens:
++        flat.extend(seq)
++        offsets.append(len(flat))
++    tokens_flat = torch.tensor(flat, dtype=torch.int32)
++    offsets_t = torch.tensor(offsets, dtype=torch.int64)
++    return tokens_flat, offsets_t
++
++
++@cache_once
++def get_ngram_corpus_cls():
++    module = load_jit(
++        "ngram_corpus",
++        cpp_files=[
++            "ngram_corpus/result.cpp",
++            "ngram_corpus/trie.cpp",
++            "ngram_corpus/ngram.cpp",
++            "ngram_corpus/ngram_corpus_ffi.cpp",
++        ],
++        header_only=False,
++    )
++    module.register_once()
++
++    @tvm_ffi.register_object("sgl.NgramCorpus")
++    class NgramCorpusFFI(tvm_ffi.Object):
++        __slots__ = ("__dict__",)
++
++        def __init__(
++            self,
++            capacity: int,
++            max_trie_depth: int,
++            min_bfs_breadth: int,
++            max_bfs_breadth: int,
++            draft_token_num: int,
++            match_type: str,
++        ) -> None:
++            mt = _MATCH_TYPE_MAP.get(match_type)
++            if mt is None:
++                raise ValueError(
++                    f"Unknown match_type: '{match_type}'. Must be 'BFS' or 'PROB'."
++                )
++            self.__ffi_init__(
++                capacity,
++                max_trie_depth,
++                min_bfs_breadth,
++                max_bfs_breadth,
++                draft_token_num,
++                mt,
++            )
++            self._draft_token_num = draft_token_num
++
++        def insert(self, batch_tokens: List[List[int]]) -> None:
++            tokens_flat, offsets = _to_csr(batch_tokens)
++            self.async_insert(tokens_flat, offsets)  # type: ignore
++
++        def match(
++            self,
++            batch_tokens: List[List[int]],
++        ) -> Tuple[np.ndarray, np.ndarray]:
++            tokens_flat, offsets = _to_csr(batch_tokens)
++            batch_size = len(batch_tokens)
++            d = self._draft_token_num
++
++            out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
++            out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
++
++            self.batch_match(tokens_flat, offsets, out_tokens, out_mask)  # type: ignore
++
++            return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(
++                np.int64
++            )
++
++        def match_stateful(
++            self,
++            state_ids: List[int],
++            batch_tokens: List[List[int]],
++            total_lens: List[int],
++        ) -> Tuple[np.ndarray, np.ndarray]:
++            tokens_flat, offsets = _to_csr(batch_tokens)
++            batch_size = len(batch_tokens)
++            d = self._draft_token_num
++
++            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
++            total_lens_t = torch.tensor(total_lens, dtype=torch.int64)
++            out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
++            out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
++
++            self.batch_match_stateful(  # type: ignore
++                state_ids_t, tokens_flat, offsets, total_lens_t, out_tokens, out_mask
++            )
++
++            return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(
++                np.int64
++            )
++
++        def erase_states(self, state_ids: List[int]) -> None:
++            state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
++            self.erase_match_state(state_ids_t)  # type: ignore
++
++    return NgramCorpusFFI
+diff --git a/python/sglang/jit_kernel/nvfp4.py b/python/sglang/jit_kernel/nvfp4.py
+index e13c8ac61..72ceff92e 100644
+--- a/python/sglang/jit_kernel/nvfp4.py
++++ b/python/sglang/jit_kernel/nvfp4.py
+@@ -1,14 +1,11 @@
+ from __future__ import annotations
+ 
+-import importlib.util
+ import os
+-import pathlib
+-from contextlib import contextmanager
+ from typing import TYPE_CHECKING, Optional, Tuple
+ 
+ import torch
+ 
+-from sglang.jit_kernel.utils import cache_once, load_jit
++from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
+ from sglang.srt.utils.custom_op import register_custom_op
+ 
+ if TYPE_CHECKING:
+@@ -19,43 +16,6 @@ _FLOAT4_E2M1_MAX = 6.0
+ _FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+ 
+ 
+-def _find_package_root(package: str) -> Optional[pathlib.Path]:
+-    spec = importlib.util.find_spec(package)
+-    if spec is None or spec.origin is None:
+-        return None
+-    return pathlib.Path(spec.origin).resolve().parent
+-
+-
+-def _resolve_cutlass_include_paths() -> list[str]:
+-    include_paths: list[str] = []
+-
+-    flashinfer_root = _find_package_root("flashinfer")
+-    if flashinfer_root is not None:
+-        candidates = [
+-            flashinfer_root / "data" / "cutlass" / "include",
+-            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
+-        ]
+-        for path in candidates:
+-            if path.exists():
+-                include_paths.append(str(path))
+-
+-    deep_gemm_root = _find_package_root("deep_gemm")
+-    if deep_gemm_root is not None:
+-        candidate = deep_gemm_root / "include"
+-        if candidate.exists():
+-            include_paths.append(str(candidate))
+-
+-    # De-duplicate while preserving order.
+-    unique_paths = []
+-    seen = set()
+-    for path in include_paths:
+-        if path in seen:
+-            continue
+-        seen.add(path)
+-        unique_paths.append(path)
+-    return unique_paths
+-
+-
+ def _nvfp4_cuda_flags() -> list[str]:
+     return [
+         "-DNDEBUG",
+@@ -70,7 +30,7 @@ def _nvfp4_cuda_flags() -> list[str]:
+     ]
+ 
+ 
+-def _get_nvfp4_cuda_arch_list() -> str:
++def _nvfp4_arch_env():
+     if not torch.cuda.is_available():
+         raise RuntimeError("NVFP4 JIT kernels require CUDA.")
+     major, minor = torch.cuda.get_device_capability()
+@@ -83,32 +43,11 @@ def _get_nvfp4_cuda_arch_list() -> str:
+     # JIT compilation targets only the current device, unlike AOT fat-binaries;
+     # adding extra architectures here would clash with the single SGL_CUDA_ARCH
+     # value injected by load_jit().
+-    return f"{major}.{minor}a"
+-
+-
+-@contextmanager
+-def _nvfp4_arch_env():
+-    key = "TVM_FFI_CUDA_ARCH_LIST"
+-    old_val = os.environ.get(key)
+-    os.environ[key] = _get_nvfp4_cuda_arch_list()
+-    try:
+-        yield
+-    finally:
+-        if old_val is None:
+-            os.environ.pop(key, None)
+-        else:
+-            os.environ[key] = old_val
++    return override_jit_cuda_arch(major, minor, suffix="a")
+ 
+ 
+ @cache_once
+ def _jit_nvfp4_quant_module() -> Module:
+-    extra_include_paths = _resolve_cutlass_include_paths()
+-    if not extra_include_paths:
+-        raise RuntimeError(
+-            "Cannot find CUTLASS headers required for NVFP4 JIT quantization. "
+-            "Please install flashinfer or deep_gemm with CUTLASS headers."
+-        )
+-
+     with _nvfp4_arch_env():
+         return load_jit(
+             "nvfp4_quant",
+@@ -118,20 +57,13 @@ def _jit_nvfp4_quant_module() -> Module:
+             cuda_wrappers=[
+                 ("scaled_fp4_quant", "scaled_fp4_quant_sm100a_sm120a"),
+             ],
+-            extra_include_paths=extra_include_paths,
+             extra_cuda_cflags=_nvfp4_cuda_flags(),
++            extra_dependencies=["cutlass"],
+         )
+ 
+ 
+ @cache_once
+ def _jit_nvfp4_expert_quant_module() -> Module:
+-    extra_include_paths = _resolve_cutlass_include_paths()
+-    if not extra_include_paths:
+-        raise RuntimeError(
+-            "Cannot find CUTLASS headers required for NVFP4 JIT expert quantization. "
+-            "Please install flashinfer or deep_gemm with CUTLASS headers."
+-        )
+-
+     with _nvfp4_arch_env():
+         return load_jit(
+             "nvfp4_expert_quant",
+@@ -145,20 +77,13 @@ def _jit_nvfp4_expert_quant_module() -> Module:
+                     "silu_and_mul_scaled_fp4_experts_quant_sm100a",
+                 ),
+             ],
+-            extra_include_paths=extra_include_paths,
++            extra_dependencies=["cutlass"],
+             extra_cuda_cflags=_nvfp4_cuda_flags(),
+         )
+ 
+ 
+ @cache_once
+ def _jit_nvfp4_scaled_mm_module() -> Module:
+-    extra_include_paths = _resolve_cutlass_include_paths()
+-    if not extra_include_paths:
+-        raise RuntimeError(
+-            "Cannot find CUTLASS headers required for NVFP4 JIT GEMM. "
+-            "Please install flashinfer or deep_gemm with CUTLASS headers."
+-        )
+-
+     with _nvfp4_arch_env():
+         return load_jit(
+             "nvfp4_scaled_mm",
+@@ -167,20 +92,13 @@ def _jit_nvfp4_scaled_mm_module() -> Module:
+                 "gemm/nvfp4/nvfp4_scaled_mm_entry.cuh",
+             ],
+             cuda_wrappers=[("cutlass_scaled_fp4_mm", "cutlass_scaled_fp4_mm")],
+-            extra_include_paths=extra_include_paths,
++            extra_dependencies=["cutlass"],
+             extra_cuda_cflags=_nvfp4_cuda_flags(),
+         )
+ 
+ 
+ @cache_once
+ def _jit_nvfp4_blockwise_moe_module() -> Module:
+-    extra_include_paths = _resolve_cutlass_include_paths()
+-    if not extra_include_paths:
+-        raise RuntimeError(
+-            "Cannot find CUTLASS headers required for NVFP4 JIT MoE grouped GEMM. "
+-            "Please install flashinfer or deep_gemm with CUTLASS headers."
+-        )
+-
+     with _nvfp4_arch_env():
+         return load_jit(
+             "nvfp4_blockwise_moe",
+@@ -190,7 +108,7 @@ def _jit_nvfp4_blockwise_moe_module() -> Module:
+             cuda_wrappers=[
+                 ("cutlass_fp4_group_mm", "cutlass_fp4_group_mm_sm100a_sm120a")
+             ],
+-            extra_include_paths=extra_include_paths,
++            extra_dependencies=["cutlass"],
+             extra_cuda_cflags=_nvfp4_cuda_flags(),
+         )
+ 
+diff --git a/python/sglang/jit_kernel/tests/test_dependency.py b/python/sglang/jit_kernel/tests/test_dependency.py
+new file mode 100644
+index 000000000..9fc981956
+--- /dev/null
++++ b/python/sglang/jit_kernel/tests/test_dependency.py
+@@ -0,0 +1,13 @@
++import pytest
++
++from sglang.jit_kernel.utils import _REGISTERED_DEPENDENCIES
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
++register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
++
++
++@pytest.mark.parametrize("name", _REGISTERED_DEPENDENCIES.keys())
++def test_availability(name: str) -> None:
++    # NOTE: the path resolution should not fail
++    _REGISTERED_DEPENDENCIES[name]()
+diff --git a/python/sglang/jit_kernel/utils.py b/python/sglang/jit_kernel/utils.py
+index fdcbc8e8a..ec3ebd5ab 100644
+--- a/python/sglang/jit_kernel/utils.py
++++ b/python/sglang/jit_kernel/utils.py
+@@ -1,9 +1,24 @@
+ from __future__ import annotations
+ 
+ import functools
++import importlib.util
++import logging
+ import os
+ import pathlib
+-from typing import TYPE_CHECKING, Any, Callable, List, Tuple, TypeAlias, TypeVar, Union
++from contextlib import contextmanager
++from dataclasses import dataclass
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Callable,
++    Dict,
++    List,
++    Optional,
++    Tuple,
++    TypeAlias,
++    TypeVar,
++    Union,
++)
+ 
+ import torch
+ 
+@@ -15,6 +30,8 @@ if TYPE_CHECKING:
+ F = TypeVar("F", bound=Callable[..., Any])
+ _FULL_TEST_ENV_VAR = "SGLANG_JIT_KERNEL_RUN_FULL_TESTS"
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def should_run_full_tests() -> bool:
+     return os.getenv(_FULL_TEST_ENV_VAR, "false").lower() == "true"
+@@ -72,10 +89,6 @@ def _resolve_kernel_path() -> pathlib.Path:
+ KERNEL_PATH = _resolve_kernel_path()
+ DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
+ DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
+-DEFAULT_CUDA_CFLAGS = ["-std=c++20", "-O3", "--expt-relaxed-constexpr"]
+-DEFAULT_HIP_CFLAGS = [
+-    flag for flag in DEFAULT_CUDA_CFLAGS if flag != "--expt-relaxed-constexpr"
+-]
+ DEFAULT_LDFLAGS = []
+ CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool, torch.dtype]
+ 
+@@ -125,7 +138,9 @@ def load_jit(
+     extra_cuda_cflags: List[str] | None = None,
+     extra_ldflags: List[str] | None = None,
+     extra_include_paths: List[str] | None = None,
++    extra_dependencies: List[str] | None = None,
+     build_directory: str | None = None,
++    header_only: bool = True,
+ ) -> Module:
+     """
+     Loading a JIT module from C++/CUDA source files.
+@@ -151,82 +166,247 @@ def load_jit(
+     :type extra_ldflags: List[str] | None
+     :param extra_include_paths: Extra include paths.
+     :type extra_include_paths: List[str] | None
++    :param extra_dependencies: Extra dependencies for the JIT module, e.g., cutlass.
++    :type extra_dependencies: List[str] | None
+     :param build_directory: The build directory for JIT compilation.
+     :type build_directory: str | None
++    :param header_only: Whether the module is header-only.
++                        If true, apply the wrappers to export given class/functions.
++                        Otherwise, we must export from C++/CUDA side.
+     :return: A just-in-time(JIT) compiled module.
+     :rtype: Module
+     """
+ 
+-    from tvm_ffi.cpp import load_inline
++    from tvm_ffi.cpp import load, load_inline
+ 
+     cpp_files = cpp_files or []
+     cuda_files = cuda_files or []
+-    cpp_wrappers = cpp_wrappers or []
+-    cuda_wrappers = cuda_wrappers or []
+     extra_cflags = extra_cflags or []
+     extra_cuda_cflags = extra_cuda_cflags or []
+     extra_ldflags = extra_ldflags or []
+     extra_include_paths = extra_include_paths or []
+ 
+-    # include cpp files
+-    cpp_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cpp_files]
+-    cpp_sources = [f'#include "{path}"' for path in cpp_paths]
+-    cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
++    cpp_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cpp_files]
++    cuda_files = [str((KERNEL_PATH / "csrc" / f).resolve()) for f in cuda_files]
++
++    for dep in set(extra_dependencies or []):
++        if dep not in _REGISTERED_DEPENDENCIES:
++            raise ValueError(f"Dependency {dep} is not registered.")
++        extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
++
++    module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
++    if header_only:
++        cpp_wrappers = cpp_wrappers or []
++        cuda_wrappers = cuda_wrappers or []
++        cpp_sources = [f'#include "{path}"' for path in cpp_files]
++        cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
++
++        # include cuda files
++        cuda_sources = [f'#include "{path}"' for path in cuda_files]
++        cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
++        with _jit_compile_context():
++            return load_inline(
++                module_name,
++                cpp_sources=cpp_sources,
++                cuda_sources=cuda_sources,
++                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
++                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
++                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
++                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
++                build_directory=build_directory,
++            )
++    else:
++        assert cpp_wrappers is None and cuda_wrappers is None
++        with _jit_compile_context():
++            return load(
++                module_name,
++                cpp_files=cpp_files,
++                cuda_files=cuda_files,
++                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
++                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
++                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
++                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
++                build_directory=build_directory,
++            )
++
++
++@dataclass
++class ArchInfo:
++    major: int
++    minor: int
++    suffix: str
++
++    @property
++    def target_name(self) -> str:
++        return f"{self.major}.{self.minor}{self.suffix}"
++
++    @property
++    def jit_flag(self) -> str:
++        return f"-DSGL_CUDA_ARCH={self.major * 100 + self.minor * 10}"
++
++
++@cache_once
++def _init_jit_cuda_arch_once():
++    global _CUDA_ARCH
++    try:
++        device = torch.cuda.current_device()
++        major, minor = torch.cuda.get_device_capability(device)
++    except Exception:
++        logger.warning("Cannot detect CUDA architecture.")
++        major, minor = 0, 0  # invalid value to trigger compile error if used
++    _CUDA_ARCH = ArchInfo(major, minor, "")
+ 
+-    # include cuda files
+-    cuda_paths = [(KERNEL_PATH / "csrc" / f).resolve() for f in cuda_files]
+-    cuda_sources = [f'#include "{path}"' for path in cuda_paths]
+-    cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
+ 
+-    # Override TVM_FFI_CUDA_ARCH_LIST if it does not exist.
++@contextmanager
++def _jit_compile_context():
++    if is_hip_runtime():
++        yield  # TODO: support ROCm `TVM_FFI_ROCM_ARCH_LIST` if needed
++        return
+     env_key = "TVM_FFI_CUDA_ARCH_LIST"
+-    env_existed = env_key in os.environ
+-    selected_cuda_cflags = DEFAULT_CUDA_CFLAGS
++    old_value = os.environ.get(env_key, None)
++    os.environ[env_key] = get_jit_cuda_arch().target_name
++    try:
++        yield
++    finally:
++        if old_value is None:
++            os.environ.pop(env_key, None)
++        else:
++            os.environ[env_key] = old_value
++
++
++# NOTE: this might also be used in __main__.py for compile flags export
++def _get_default_target_flags() -> List[str]:
+     if is_hip_runtime():
+-        selected_cuda_cflags = DEFAULT_HIP_CFLAGS
+-        extra_cuda_cflags = ["-DUSE_ROCM"] + extra_cuda_cflags
++        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
+     else:
+-        extra_cuda_cflags = [
+-            f"-DSGL_CUDA_ARCH={_get_cuda_arch_value()}"
+-        ] + extra_cuda_cflags
+-    if not env_existed:
+-        os.environ[env_key] = _get_cuda_arch_list()
++        return [
++            get_jit_cuda_arch().jit_flag,
++            "-std=c++20",
++            "-O3",
++            "--expt-relaxed-constexpr",
++        ]
++
++
++@contextmanager
++def override_jit_cuda_arch(major: int, minor: int, suffix: str = ""):
++    """A context manager to temporarily override CUDA architecture."""
++    global _CUDA_ARCH
++    old_value = get_jit_cuda_arch()
++    _CUDA_ARCH = ArchInfo(major, minor, suffix)
+     try:
+-        return load_inline(
+-            "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
+-            cpp_sources=cpp_sources,
+-            cuda_sources=cuda_sources,
+-            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+-            extra_cuda_cflags=selected_cuda_cflags + extra_cuda_cflags,
+-            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+-            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+-            build_directory=build_directory,
+-        )
++        yield
+     finally:
+-        # Reset TVM_FFI_CUDA_ARCH_LIST to original state (not exist)
+-        if not env_existed:
+-            del os.environ[env_key]
++        _CUDA_ARCH = old_value
++
++
++def get_jit_cuda_arch() -> ArchInfo:
++    """Get the current CUDA architecture info."""
++    _init_jit_cuda_arch_once()
++    return _CUDA_ARCH
+ 
+ 
+-@cache_once
+ def is_arch_support_pdl() -> bool:
+-    import torch
++    if is_hip_runtime():
++        return False
++    return get_jit_cuda_arch().major >= 9
+ 
+-    device = torch.cuda.current_device()
+-    return torch.cuda.get_device_capability(device)[0] >= 9
+ 
++def _find_package_root(package: str) -> Optional[pathlib.Path]:
++    spec = importlib.util.find_spec(package)
++    if spec is None or spec.origin is None:
++        return None
++    return pathlib.Path(spec.origin).resolve().parent
+ 
+-@cache_once
+-def _get_cuda_arch_value() -> int:
+-    """Get CUDA arch value for -DSGL_CUDA_ARCH (e.g. 900 for SM 9.0)."""
+-    device = torch.cuda.current_device()
+-    major, minor = torch.cuda.get_device_capability(device)
+-    return major * 100 + minor * 10
+ 
++# NOTE: this might also be used in __main__.py for compile flags export
++_REGISTERED_DEPENDENCIES: Dict[str, Callable[[], List[str]]] = {}
+ 
+-@cache_once
+-def _get_cuda_arch_list() -> str:
+-    """Get the correct CUDA architecture string for TVM_FFI_CUDA_ARCH_LIST."""
+-    device = torch.cuda.current_device()
+-    major, minor = torch.cuda.get_device_capability(device)
+-    return f"{major}.{minor}"
++
++def register_dependency(name: str):
++    def decorator(f: Callable[[], List[str]]) -> Callable[[], List[str]]:
++        if name in _REGISTERED_DEPENDENCIES:
++            raise ValueError(f"Dependency {name} already registered")
++        _REGISTERED_DEPENDENCIES[name] = f
++        return f
++
++    return decorator
++
++
++@register_dependency("flashinfer")
++def get_flashinfer_include_paths() -> List[str]:
++    include_paths: List[str] = []
++    flashinfer_root = _find_package_root("flashinfer")
++    if flashinfer_root is None:
++        raise RuntimeError(
++            "Cannot find flashinfer package. Please install flashinfer to get"
++            "the required headers for JIT compilation."
++        )
++
++    flashinfer_data = flashinfer_root / "data"
++    candidates = [
++        flashinfer_data / "include",
++        flashinfer_data / "csrc",
++        flashinfer_data / "cutlass" / "include",
++        flashinfer_data / "cutlass" / "tools" / "util" / "include",
++        flashinfer_data / "spdlog" / "include",
++    ]
++
++    for path in candidates:
++        if not path.exists():
++            raise RuntimeError(
++                f"Required header path {path} for flashinfer dependency not found."
++                " Please check your flashinfer installation."
++            )
++        include_paths.append(str(path))
++    return include_paths
++
++
++@register_dependency("cutlass")
++def get_cutlass_include_paths() -> List[str]:
++    include_paths: List[str] = []
++
++    flashinfer_root = _find_package_root("flashinfer")
++    if flashinfer_root is not None:
++        candidates = [
++            flashinfer_root / "data" / "cutlass" / "include",
++            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
++        ]
++        for path in candidates:
++            if path.exists():
++                include_paths.append(str(path))
++
++    deep_gemm_root = _find_package_root("deep_gemm")
++    if deep_gemm_root is not None:
++        candidate = deep_gemm_root / "include"
++        if candidate.exists():
++            include_paths.append(str(candidate))
++
++    # De-duplicate while preserving order.
++    unique_paths = []
++    seen = set()
++    for path in include_paths:
++        if path in seen:
++            continue
++        seen.add(path)
++        unique_paths.append(path)
++
++    if not unique_paths:
++        raise RuntimeError(
++            "Cannot find CUTLASS headers required for JIT compilation. "
++            "Please install flashinfer or deep_gemm with CUTLASS headers."
++        )
++    return unique_paths
++
++
++__all__ = [
++    "should_run_full_tests",
++    "get_ci_test_range",
++    "cache_once",
++    "is_hip_runtime",
++    "make_cpp_args",
++    "load_jit",
++    "override_jit_cuda_arch",
++    "get_jit_cuda_arch",
++    "is_arch_support_pdl",
++    "register_dependency",
++]
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 8a011005d..fa00cae8f 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -499,12 +499,10 @@ class ServerArgs:
+     speculative_draft_model_quantization: Optional[str] = None
+ 
+     # Speculative decoding (ngram)
+-    speculative_ngram_min_match_window_size: int = 1
+-    speculative_ngram_max_match_window_size: int = 12
+     speculative_ngram_min_bfs_breadth: int = 1
+     speculative_ngram_max_bfs_breadth: int = 10
+     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
+-    speculative_ngram_branch_length: int = 18
++    speculative_ngram_max_trie_depth: int = 18
+     speculative_ngram_capacity: int = 10 * 1000 * 1000
+     enable_multi_layer_eagle: bool = False
+ 
+@@ -3032,8 +3030,10 @@ class ServerArgs:
+             self.enable_mixed_chunk = False
+             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
+             if self.speculative_num_draft_tokens is None:
+-                self.speculative_num_draft_tokens = (
+-                    self.speculative_ngram_max_match_window_size
++                self.speculative_num_draft_tokens = 12
++                logger.warning(
++                    "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
++                    "You can override this by explicitly setting --speculative-num-draft-tokens."
+                 )
+             logger.warning(
+                 "The overlap scheduler and mixed chunked prefill are disabled because of "
+@@ -4717,18 +4717,6 @@ class ServerArgs:
+         )
+ 
+         # Speculative decoding (ngram)
+-        parser.add_argument(
+-            "--speculative-ngram-min-match-window-size",
+-            type=int,
+-            default=ServerArgs.speculative_ngram_min_match_window_size,
+-            help="The minimum window size for pattern matching in ngram speculative decoding.",
+-        )
+-        parser.add_argument(
+-            "--speculative-ngram-max-match-window-size",
+-            type=int,
+-            default=ServerArgs.speculative_ngram_max_match_window_size,
+-            help="The maximum window size for pattern matching in ngram speculative decoding.",
+-        )
+         parser.add_argument(
+             "--speculative-ngram-min-bfs-breadth",
+             type=int,
+@@ -4749,10 +4737,10 @@ class ServerArgs:
+             help="The match type for cache tree.",
+         )
+         parser.add_argument(
+-            "--speculative-ngram-branch-length",
++            "--speculative-ngram-max-trie-depth",
+             type=int,
+-            default=ServerArgs.speculative_ngram_branch_length,
+-            help="The branch length for ngram speculative decoding.",
++            default=ServerArgs.speculative_ngram_max_trie_depth,
++            help="The max trie depth for ngram speculative decoding.",
+         )
+         parser.add_argument(
+             "--speculative-ngram-capacity",
+diff --git a/python/sglang/srt/speculative/cpp_ngram/ngram.cpp b/python/sglang/srt/speculative/cpp_ngram/ngram.cpp
+deleted file mode 100644
+index e7f0297e2..000000000
+--- a/python/sglang/srt/speculative/cpp_ngram/ngram.cpp
++++ /dev/null
+@@ -1,381 +0,0 @@
+-#include "ngram.h"
+-
+-#include <algorithm>
+-#include <chrono>
+-#include <cstring>
+-#include <limits>
+-#include <list>
+-#include <mutex>
+-#include <queue>
+-#include <stdexcept>
+-#include <thread>
+-#include <tuple>
+-#include <unordered_map>
+-#include <vector>
+-
+-namespace ngram {
+-
+-struct Node {
+-  std::unordered_map<int32_t, int32_t> next;
+-};
+-
+-Ngram::Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root) {
+-  Ngram::Result info;
+-  std::vector<int32_t> prevs;
+-  info.token.reserve(draft_token_num);
+-  prevs.reserve(draft_token_num);
+-  std::queue<std::tuple<int32_t, int32_t, int32_t>> queue;
+-  info.token.emplace_back(last_token);
+-  prevs.emplace_back(-1);
+-
+-  for (auto [token, next] : tree[root].next) {
+-    queue.emplace(token, next, 0);
+-  }
+-  while (queue.size()) {
+-    auto [token, next, prev] = queue.front();
+-    queue.pop();
+-    info.token.emplace_back(token);
+-    prevs.emplace_back(prev);
+-    for (auto [t, n] : tree[next].next) {
+-      queue.emplace(t, n, info.token.size() - 1);
+-    }
+-  }
+-
+-  // zero padding to length
+-  while (info.token.size() < draft_token_num) {
+-    info.token.emplace_back(0);
+-    prevs.emplace_back(0);
+-  }
+-
+-  int n = info.token.size();
+-  info.mask.resize(n * n, 0);
+-  info.mask[0] = 1;
+-  for (int i = 0; i < n; ++i) {
+-    if (prevs[i] != -1) {
+-      memcpy(&info.mask[i * n], &info.mask[prevs[i] * n], prevs[i] + 1);
+-    }
+-    info.mask[i * n + i] = 1;
+-  }
+-
+-  return info;
+-}
+-
+-Ngram::Ngram(size_t capacity, const Param& param) {
+-  param_ = param;
+-  nodes_.resize(capacity);
+-  for (auto& node : nodes_) {
+-    node_pool_.emplace_back(&node);
+-  }
+-  free_node_count_ = node_pool_.size();
+-  root_ = getNode();
+-
+-  if (!(param_.branch_length > 1)) {
+-    throw std::runtime_error(
+-        "param_.branch_length must be greater than 1, current value: " + std::to_string(param_.branch_length));
+-  }
+-  if (!(param_.min_match_window_size > 0)) {
+-    throw std::runtime_error(
+-        "min_match_window_size must be greater than 0, current value: " + std::to_string(param_.min_match_window_size));
+-  }
+-  if (!(param_.min_match_window_size <= param_.max_match_window_size)) {
+-    throw std::runtime_error(
+-        "min_match_window_size must be less than or equal to max_match_window_size, current min_match_window_size: " +
+-        std::to_string(param_.min_match_window_size) +
+-        ", max_match_window_size: " + std::to_string(param_.max_match_window_size));
+-  }
+-  if (!(param_.max_match_window_size < param_.branch_length)) {
+-    throw std::runtime_error(
+-        "max_match_window_size must be less than branch_length, current max_match_window_size: " +
+-        std::to_string(param_.max_match_window_size) + ", branch_length: " + std::to_string(param_.branch_length));
+-  }
+-  if (!(param_.min_bfs_breadth > 0)) {
+-    throw std::runtime_error(
+-        "min_bfs_breadth must be greater than 0, current value: " + std::to_string(param_.min_bfs_breadth));
+-  }
+-  if (!(param_.min_bfs_breadth <= param_.max_bfs_breadth)) {
+-    throw std::runtime_error(
+-        "min_bfs_breadth must be less than or equal to max_bfs_breadth, current min_bfs_breadth: " +
+-        std::to_string(param_.min_bfs_breadth) + ", max_bfs_breadth: " + std::to_string(param_.max_bfs_breadth));
+-  }
+-  if (!(param_.draft_token_num > 0)) {
+-    throw std::runtime_error(
+-        "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
+-  }
+-  for (auto config : param_.batch_draft_token_num) {
+-    if (config != std::numeric_limits<decltype(config)>::max()) {
+-      if (!(config <= param_.draft_token_num)) {
+-        throw std::runtime_error(
+-            "batch_draft_token_num config value " + std::to_string(config) +
+-            " must be less than or equal to draft_token_num: " + std::to_string(param_.draft_token_num));
+-      }
+-    }
+-  }
+-  for (auto config : param_.batch_min_match_window_size) {
+-    if (config != std::numeric_limits<decltype(config)>::max()) {
+-      if (!(config >= param_.min_match_window_size)) {
+-        throw std::runtime_error(
+-            "batch_min_match_window_size config value " + std::to_string(config) +
+-            " must be greater than or equal to min_match_window_size: " + std::to_string(param_.min_match_window_size));
+-      }
+-      if (!(config <= param_.max_match_window_size)) {
+-        throw std::runtime_error(
+-            "batch_min_match_window_size config value " + std::to_string(config) +
+-            " must be less than or equal to max_match_window_size: " + std::to_string(param_.max_match_window_size));
+-      }
+-    }
+-  }
+-
+-  quit_flag_ = false;
+-  insert_worker_ = std::thread(&Ngram::insert, this);
+-}
+-
+-Ngram::~Ngram() {
+-  quit_flag_ = true;
+-  insert_queue_.close();
+-  insert_worker_.join();
+-}
+-
+-std::vector<std::pair<TrieNode*, int32_t>> Ngram::match(const std::vector<int32_t>& tokens, size_t batch_size) const {
+-  auto draft_token_num = param_.get_draft_token_num(batch_size);
+-  auto min_match_window_size = param_.get_min_match_window_size(batch_size);
+-  auto max_match_window_size = param_.max_match_window_size;
+-  std::vector<std::pair<TrieNode*, int32_t>> result;
+-  result.reserve(param_.max_match_window_size - param_.min_match_window_size);
+-  for (int32_t match_window_size = std::min(tokens.size(), param_.max_match_window_size);
+-       match_window_size >= param_.min_match_window_size;
+-       --match_window_size) {
+-    auto start = tokens.data() + tokens.size() - match_window_size;
+-    auto end = start + match_window_size;
+-    auto cursor = root_;
+-    while (start != end) {
+-      auto iter = cursor->child.find(*start);
+-      if (iter == cursor->child.end()) {
+-        cursor = nullptr;
+-        break;
+-      }
+-      ++start;
+-      cursor = iter->second;
+-    }
+-    if (cursor) {
+-      result.emplace_back(std::make_pair(cursor, match_window_size));
+-    }
+-  }
+-  return result;
+-}
+-
+-void Ngram::squeeze(size_t count) {
+-  if (!(node_pool_.size() >= free_node_count_ + count)) {
+-    throw std::runtime_error(
+-        "Insufficient node size to release required nodes. "
+-        "available to release: " +
+-        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
+-  }
+-  while (count--) {
+-    auto last = global_lru_.back();
+-    global_lru_.pop_back();
+-
+-    if (!last->child.empty()) {
+-      throw std::runtime_error("The node to be released still has child nodes and cannot be released. ");
+-    }
+-
+-    last->parent->lru.erase(last->parent_lru_pos);
+-    last->parent->sorted_children.erase(last);
+-    last->parent->child.erase(last->token);
+-
+-    node_pool_[free_node_count_++] = last;
+-  }
+-}
+-
+-void Ngram::synchronize() const {
+-  while (!insert_queue_.empty()) {
+-    std::this_thread::sleep_for(std::chrono::microseconds(10));
+-  }
+-}
+-
+-void Ngram::insert() {
+-  while (!quit_flag_) {
+-    std::vector<int32_t> data;
+-    if (!insert_queue_.dequeue(data)) {
+-      continue;
+-    }
+-    const auto* token = data.data();
+-    size_t size = data.size();
+-    std::unique_lock<std::mutex> lock(mutex_);
+-
+-    for (size_t i = 0; i + param_.min_match_window_size < size; ++i) {
+-      auto start = token + i;
+-      auto end = start + std::min(size - i, param_.branch_length);
+-
+-      if (end - start > free_node_count_) {
+-        squeeze(end - start - free_node_count_);
+-      }
+-
+-      TrieNode* cursor = root_;
+-      path_.clear();
+-      while (start != end) {
+-        auto token = *start;
+-        auto iter = cursor->child.find(token);
+-        if (iter == cursor->child.end()) {
+-          iter = cursor->child.insert({token, getNode()}).first;
+-          auto node = iter->second;
+-
+-          cursor->lru.emplace_front(node);
+-          global_lru_.emplace_back(node);
+-
+-          node->token = token;
+-          node->parent = cursor;
+-          node->parent_lru_pos = cursor->lru.begin();
+-          node->global_lru_pos = --global_lru_.end();
+-          node->freq = 1;
+-          cursor->sorted_children.insert(node);
+-        } else {
+-          auto node = iter->second;
+-          cursor->sorted_children.erase(node);
+-          node->freq++;
+-          cursor->sorted_children.insert(node);
+-          cursor->lru.splice(cursor->lru.begin(), cursor->lru, node->parent_lru_pos);
+-        }
+-        cursor = iter->second;
+-        path_.emplace_back(cursor);
+-        ++start;
+-      }
+-
+-      for (auto it = path_.rbegin(); it != path_.rend(); ++it) {
+-        TrieNode* node = *it;
+-        global_lru_.splice(global_lru_.begin(), global_lru_, node->global_lru_pos);
+-      }
+-    }
+-  }
+-}
+-
+-void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+-  for (auto&& token : tokens) {
+-    insert_queue_.enqueue(std::move(token));
+-  }
+-}
+-
+-Ngram::Result Ngram::matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const {
+-  std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
+-
+-  double bfs_breadth_scale = double(param_.max_bfs_breadth - param_.min_bfs_breadth) /
+-                             (param_.max_match_window_size - param_.min_match_window_size + 1);
+-
+-  auto draft_token_num = param_.get_draft_token_num(batch_size);
+-  std::vector<Node> tree(draft_token_num + 1);
+-  int root = 0;
+-  int cursor = 1;
+-
+-  for (auto [node, depth] : nodes) {
+-    std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;  // parent, bfs_breadth, node
+-    queue.push({root, (param_.max_match_window_size - depth) * bfs_breadth_scale + param_.min_bfs_breadth, node});
+-    while (queue.size() && cursor <= draft_token_num) {
+-      auto front = queue.front();
+-      queue.pop();
+-
+-      auto parent = std::get<0>(front);
+-      auto cur_breadth = std::get<1>(front);
+-      auto iter = std::get<2>(front)->lru.begin();
+-
+-      auto breadth = std::max(1, int32_t(cur_breadth));
+-      for (int i = 0; i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= draft_token_num; ++i, ++iter) {
+-        auto token = (*iter)->token;
+-        auto pos = -1;
+-        if (auto tit = tree[parent].next.find(token); tit != tree[parent].next.end()) {
+-          pos = tit->second;
+-        } else {
+-          pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
+-        }
+-        queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
+-      }
+-    }
+-  }
+-
+-  return fillResult(tokens.back(), draft_token_num + 1, tree, root);
+-}
+-
+-Ngram::Result Ngram::matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const {
+-  std::vector<std::pair<TrieNode*, int32_t>> nodes = match(tokens, batch_size);
+-  auto draft_token_num = param_.get_draft_token_num(batch_size);
+-
+-  struct CompareByLastDouble {
+-    bool operator()(
+-        const std::tuple<double, const TrieNode*, double>& a,  // parent_pos,  node, final_prob
+-        const std::tuple<double, const TrieNode*, double>& b) const {
+-      return std::get<2>(a) < std::get<2>(b);
+-    }
+-  };
+-
+-  std::priority_queue<
+-      std::tuple<double, const TrieNode*, double>,
+-      std::vector<std::tuple<double, const TrieNode*, double>>,
+-      CompareByLastDouble>
+-      heap;
+-
+-  std::vector<Node> tree(draft_token_num + 1);
+-
+-  int root = 0;
+-  int cursor = 1;
+-  int top_k = param_.max_bfs_breadth;
+-
+-  auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node, double prob) -> void {
+-    double sum_freq = 0.0;
+-    int count = 0;
+-    std::list<std::pair<TrieNode*, int32_t>> topk_children;
+-    for (auto* child : trie_node->sorted_children) {
+-      sum_freq += static_cast<double>(child->freq);
+-      topk_children.emplace_back(child, child->freq);
+-      if (++count >= top_k) break;
+-    }
+-    if (sum_freq <= 0) sum_freq = 1.0;
+-    for (const auto& [child, freq] : topk_children) {
+-      double norm_freq = static_cast<double>(freq) / sum_freq * prob;
+-      heap.emplace(parent, child, norm_freq);
+-    }
+-  };
+-
+-  for (auto [node, _] : nodes) {
+-    addToHeap(root, node, 1.0);
+-
+-    while (!heap.empty() && cursor <= draft_token_num) {
+-      auto [parent, trie_node, prob] = heap.top();  // parent_pos, node, final_prob
+-      heap.pop();
+-      auto token = trie_node->token;
+-      int pos = -1;
+-      auto tit = tree[parent].next.find(token);
+-      if (tit != tree[parent].next.end()) {
+-        pos = tit->second;
+-      } else {
+-        pos = cursor++;
+-        tree[parent].next[token] = pos;
+-      }
+-      addToHeap(pos, trie_node, prob);
+-    }
+-  }
+-
+-  return fillResult(tokens.back(), draft_token_num + 1, tree, root);
+-}
+-
+-Ngram::Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) const {
+-  std::unique_lock<std::mutex> lock(mutex_);
+-  Result merged_result;
+-  auto match_func = param_.match_type == "BFS" ? &Ngram::matchBFS : &Ngram::matchProb;
+-  for (const auto& tks : tokens) {
+-    Result res = (this->*match_func)(tks, tokens.size());
+-    merged_result.token.insert(merged_result.token.end(), res.token.begin(), res.token.end());
+-    merged_result.mask.insert(merged_result.mask.end(), res.mask.begin(), res.mask.end());
+-  }
+-  return merged_result;
+-}
+-
+-void Ngram::Result::truncate(size_t n) {
+-  if (n < token.size()) {
+-    int full_n = token.size();
+-    for (int i = 1; i < n; ++i) {
+-      memcpy(&mask[i * n], &mask[i * full_n], sizeof(mask[0]) * n);
+-    }
+-    token.resize(n);
+-    mask.resize(n * n);
+-  }
+-}
+-
+-}  // namespace ngram
+diff --git a/python/sglang/srt/speculative/cpp_ngram/ngram.h b/python/sglang/srt/speculative/cpp_ngram/ngram.h
+deleted file mode 100644
+index 3c9a9380e..000000000
+--- a/python/sglang/srt/speculative/cpp_ngram/ngram.h
++++ /dev/null
+@@ -1,111 +0,0 @@
+-#pragma once
+-
+-#include <cstddef>
+-#include <cstdint>
+-#include <functional>
+-#include <list>
+-#include <mutex>
+-#include <new>
+-#include <set>
+-#include <sstream>
+-#include <thread>
+-#include <tuple>
+-#include <unordered_map>
+-#include <vector>
+-
+-#include "param.h"
+-#include "queue.h"
+-
+-namespace ngram {
+-
+-struct TrieNode {
+-  std::unordered_map<int32_t, TrieNode*> child;
+-  std::list<TrieNode*>::const_iterator global_lru_pos;
+-  std::list<TrieNode*>::const_iterator parent_lru_pos;
+-  int32_t token;
+-  TrieNode* parent;
+-  std::list<TrieNode*> lru;
+-  int32_t freq = 0;
+-
+-  struct CompareByFreq {
+-    bool operator()(TrieNode* a, TrieNode* b) const {
+-      return std::tie(b->freq, a->token, a) < std::tie(a->freq, b->token, b);
+-    }
+-  };
+-  std::multiset<TrieNode*, CompareByFreq> sorted_children;
+-};
+-
+-class Ngram {
+-  std::vector<TrieNode> nodes_;
+-  std::vector<TrieNode*> node_pool_;
+-  size_t free_node_count_;
+-  std::list<TrieNode*> global_lru_;
+-  TrieNode* root_;
+-  std::vector<TrieNode*> path_;
+-  Param param_;
+-
+-  std::vector<std::pair<TrieNode*, int32_t>> match(const std::vector<int32_t>& tokens, size_t batch_size) const;
+-
+-  void squeeze(size_t count);
+-
+-  TrieNode* getNode() {
+-    auto node = node_pool_[--free_node_count_];
+-    node->~TrieNode();
+-    new (node) TrieNode();
+-    return node;
+-  }
+-
+-  mutable std::mutex mutex_;
+-  bool quit_flag_;
+-  utils::Queue<std::vector<int32_t>> insert_queue_;
+-  std::thread insert_worker_;
+-  std::vector<std::tuple<int32_t, int32_t, int32_t, int32_t>> match_tmp_data_;
+-
+- public:
+-  Ngram(size_t capacity, const Param& param);
+-  Ngram() = default;
+-  ~Ngram();
+-
+-  static Ngram& instance() {
+-    static Ngram instance;
+-    return instance;
+-  }
+-
+-  void synchronize() const;
+-
+-  void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
+-
+-  struct Result {
+-    std::vector<int32_t> token;
+-    std::vector<uint8_t> mask;
+-
+-    void truncate(size_t n);
+-  };
+-
+-  Result batchMatch(const std::vector<std::vector<int32_t>>& tokens) const;
+-
+-  void reset() {
+-    std::unique_lock<std::mutex> lock(mutex_);
+-
+-    global_lru_.clear();
+-    path_.clear();
+-    node_pool_.clear();
+-    for (auto& node : nodes_) {
+-      node_pool_.emplace_back(&node);
+-    }
+-    free_node_count_ = node_pool_.size();
+-    root_ = getNode();
+-  }
+-
+-  const Param& param() const {
+-    return param_;
+-  }
+-
+- private:
+-  Result matchBFS(const std::vector<int32_t>& tokens, size_t batch_size) const;
+-  Result matchProb(const std::vector<int32_t>& tokens, size_t batch_size) const;
+-
+-  void insert();
+-};
+-
+-}  // namespace ngram
+diff --git a/python/sglang/srt/speculative/cpp_ngram/ngram_cache_binding.cpp b/python/sglang/srt/speculative/cpp_ngram/ngram_cache_binding.cpp
+deleted file mode 100644
+index ac5b931f9..000000000
+--- a/python/sglang/srt/speculative/cpp_ngram/ngram_cache_binding.cpp
++++ /dev/null
+@@ -1,43 +0,0 @@
+-#include <pybind11/pybind11.h>
+-#include <pybind11/stl.h>
+-
+-#include "ngram.h"
+-
+-PYBIND11_MODULE(ngram_cache_cpp, m) {
+-  using namespace ngram;
+-  namespace py = pybind11;
+-  m.doc() = "";
+-
+-  py::class_<Ngram>(m, "Ngram")
+-      .def(py::init<size_t, const Param&>(), py::arg("capacity"), py::arg("param"))
+-      .def("asyncInsert", &Ngram::asyncInsert, "")
+-      .def("batchMatch", &Ngram::batchMatch, "")
+-      .def("reset", &Ngram::reset, "")
+-      .def("synchronize", &Ngram::synchronize, "");
+-
+-  py::class_<Param>(m, "Param")
+-      .def(py::init<>())
+-      .def_readwrite("enable", &Param::enable)
+-      .def_readwrite("enable_router_mode", &Param::enable_router_mode)
+-      .def_readwrite("min_bfs_breadth", &Param::min_bfs_breadth)
+-      .def_readwrite("max_bfs_breadth", &Param::max_bfs_breadth)
+-      .def_readwrite("min_match_window_size", &Param::min_match_window_size)
+-      .def_readwrite("max_match_window_size", &Param::max_match_window_size)
+-      .def_readwrite("branch_length", &Param::branch_length)
+-      .def_readwrite("draft_token_num", &Param::draft_token_num)
+-      .def_readwrite("match_type", &Param::match_type)
+-      .def_readwrite("batch_min_match_window_size", &Param::batch_min_match_window_size)
+-      .def_readwrite("batch_draft_token_num", &Param::batch_draft_token_num)
+-      .def("get_draft_token_num", &Param::get_draft_token_num, "")
+-      .def("get_min_match_window_size", &Param::get_min_match_window_size, "")
+-      .def("parse", &Param::parse, "")
+-      .def("resetBatchMinMatchWindowSize", &Param::resetBatchMinMatchWindowSize, "")
+-      .def("resetBatchReturnTokenNum", &Param::resetBatchReturnTokenNum, "")
+-      .def("detail", &Param::detail, "");
+-
+-  py::class_<Ngram::Result>(m, "Result")
+-      .def(py::init<>())
+-      .def_readwrite("token", &Ngram::Result::token)
+-      .def_readwrite("mask", &Ngram::Result::mask)
+-      .def("truncate", &Ngram::Result::truncate);
+-}
+diff --git a/python/sglang/srt/speculative/cpp_ngram/ngram_cache.py b/python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py
+similarity index 58%
+rename from python/sglang/srt/speculative/cpp_ngram/ngram_cache.py
+rename to python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py
+index 8b1eb8eea..0795e3bf4 100644
+--- a/python/sglang/srt/speculative/cpp_ngram/ngram_cache.py
++++ b/python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py
+@@ -1,62 +1,75 @@
+ # -*- coding: utf-8 -*-
+ 
+ import logging
+-import os
+-from typing import List, Tuple
++from typing import Dict, List, Tuple
+ 
+ import numpy as np
+-from torch.utils.cpp_extension import load
+ 
+-logger = logging.getLogger(__name__)
++from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
+ 
+-_abs_path = os.path.dirname(os.path.abspath(__file__))
+-ngram_cache_cpp = load(
+-    name="ngram_cache_cpp",
+-    sources=[
+-        f"{_abs_path}/ngram_cache_binding.cpp",
+-        f"{_abs_path}/ngram.cpp",
+-    ],
+-    extra_cflags=["-O3", "-std=c++20"],
+-)
++logger = logging.getLogger(__name__)
+ 
+ 
+-class NgramCache:
++class NgramCorpus:
+     def __init__(
+         self,
+-        branch_length=18,
+-        min_match_window_size=1,
+-        max_match_window_size=10,
++        max_trie_depth=18,
+         min_bfs_breadth=1,
+         max_bfs_breadth=8,
+         draft_token_num=8,
+         match_type="BFS",
+         capacity=1000000,
+-    ):
+-        param = ngram_cache_cpp.Param()
+-        param.branch_length = branch_length
+-        param.min_match_window_size = min_match_window_size
+-        param.max_match_window_size = max_match_window_size
+-        param.min_bfs_breadth = min_bfs_breadth
+-        param.max_bfs_breadth = max_bfs_breadth
+-        param.draft_token_num = draft_token_num
+-        param.match_type = match_type
+-        self.cache = ngram_cache_cpp.Ngram(capacity, param)
+-
++    ) -> None:
++        cls = get_ngram_corpus_cls()
++        self._obj = cls(
++            capacity=capacity,
++            max_trie_depth=max_trie_depth,
++            min_bfs_breadth=min_bfs_breadth,
++            max_bfs_breadth=max_bfs_breadth,
++            draft_token_num=draft_token_num,
++            match_type=match_type,
++        )
+         self.default_mask = np.ones((1, 1), dtype=np.int64)
+         self.draft_token_num = draft_token_num
++        self._req_id_to_state_id: Dict[str, int] = {}
++        self._next_state_id: int = 0
++
++    def _get_state_id(self, req_id: str) -> int:
++        sid = self._req_id_to_state_id.get(req_id)
++        if sid is None:
++            sid = self._next_state_id
++            self._next_state_id += 1
++            self._req_id_to_state_id[req_id] = sid
++        return sid
+ 
+     def batch_put(self, batch_tokens: List[List[int]]):
+-        self.cache.asyncInsert(batch_tokens)
++        self._obj.insert(batch_tokens)
+ 
+     def synchronize(self):
+-        self.cache.synchronize()
++        self._obj.synchronize()  # type: ignore
+ 
+     def reset(self):
+-        self.cache.reset()
++        self._obj.reset()  # type: ignore
++        self._req_id_to_state_id.clear()
++        self._next_state_id = 0
+ 
+-    def batch_get(self, batch_tokens: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
+-        result = self.cache.batchMatch(batch_tokens)
+-        return np.array(result.token), np.array(result.mask)
++    def batch_get(
++        self,
++        req_ids: List[str],
++        batch_tokens: List[List[int]],
++        total_lens: List[int],
++    ) -> Tuple[np.ndarray, np.ndarray]:
++        state_ids = [self._get_state_id(rid) for rid in req_ids]
++        return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
++
++    def erase_match_state(self, req_ids: List[str]):
++        state_ids = []
++        for rid in req_ids:
++            sid = self._req_id_to_state_id.pop(rid, None)
++            if sid is not None:
++                state_ids.append(sid)
++        if state_ids:
++            self._obj.erase_states(state_ids)
+ 
+     def leaf_paths_from_mask(
+         self, tokens: List[int], tree_mask: List[List[int]]
+@@ -129,10 +142,15 @@ if __name__ == "__main__":
+         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+         [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
+     ]
+-    cache = NgramCache(branch_length=12, draft_token_num=8)
+-    cache.batch_put(token_ids)
+-
+-    cache.synchronize()
+-    decoding_ids, decoding_masks = cache.batch_get([[1, 2, 3], [3, 44], [3, 6, 999]])
++    corpus = NgramCorpus(max_trie_depth=12, draft_token_num=8)
++    corpus.batch_put(token_ids)
++
++    corpus.synchronize()
++    queries = [[1, 2, 3], [3, 44], [3, 6, 999]]
++    decoding_ids, decoding_masks = corpus.batch_get(
++        req_ids=[f"query-{i}" for i in range(len(queries))],
++        batch_tokens=queries,
++        total_lens=[len(q) for q in queries],
++    )
+ 
+-    cache.debug_result(decoding_ids, decoding_masks)
++    corpus.debug_result(decoding_ids, decoding_masks)
+diff --git a/python/sglang/srt/speculative/ngram_worker.py b/python/sglang/srt/speculative/ngram_worker.py
+index 7f6277bb8..3b184d946 100644
+--- a/python/sglang/srt/speculative/ngram_worker.py
++++ b/python/sglang/srt/speculative/ngram_worker.py
+@@ -11,7 +11,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
+ from sglang.srt.managers.tp_worker import TpModelWorker
+ from sglang.srt.model_executor.forward_batch_info import ForwardMode
+ from sglang.srt.server_args import ServerArgs
+-from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
++from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+ from sglang.srt.speculative.ngram_info import NgramVerifyInput
+ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+ from sglang.srt.speculative.spec_utils import generate_token_bitmask
+@@ -40,28 +40,24 @@ class NGRAMWorker:
+         self.tp_rank = tp_rank
+         self.page_size = server_args.page_size
+         self.draft_token_num: int = server_args.speculative_num_draft_tokens
+-        self.branch_length: int = server_args.speculative_ngram_branch_length
+-        self.max_match_window_size: int = (
+-            server_args.speculative_ngram_max_match_window_size
+-        )
++        self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
+ 
+         self.max_batch_size = target_worker.max_running_requests
+         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+ 
+         self._init_preallocated_tensors()
+ 
+-        self.ngram_cache = NgramCache(
+-            min_match_window_size=server_args.speculative_ngram_min_match_window_size,
+-            max_match_window_size=server_args.speculative_ngram_max_match_window_size,
++        self.ngram_corpus = NgramCorpus(
+             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
+             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
++            match_type=server_args.speculative_ngram_match_type,
+             capacity=server_args.speculative_ngram_capacity,
+-            branch_length=server_args.speculative_ngram_branch_length,
++            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
+             draft_token_num=server_args.speculative_num_draft_tokens,
+         )
+ 
+     def clear_cache_pool(self):
+-        self.ngram_cache.reset()
++        self.ngram_corpus.reset()
+ 
+     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
+         seq2_len = len(seq2)
+@@ -126,14 +122,20 @@ class NGRAMWorker:
+     ) -> tuple[np.ndarray, np.ndarray]:
+         bs = batch.batch_size()
+ 
+-        self.ngram_cache.synchronize()
++        self.ngram_corpus.synchronize()
++        req_ids = []
+         batch_tokens = []
++        total_lens = []
+         for req in batch.reqs:
+             check_token = self._efficient_concat_last_n(
+-                req.origin_input_ids, req.output_ids, self.max_match_window_size
++                req.origin_input_ids, req.output_ids, self.max_trie_depth
+             )
++            req_ids.append(req.rid)
+             batch_tokens.append(check_token)
+-        req_drafts, mask = self.ngram_cache.batch_get(batch_tokens)
++            total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
++        req_drafts, mask = self.ngram_corpus.batch_get(
++            req_ids, batch_tokens, total_lens
++        )
+         total_draft_token_num = len(req_drafts)
+ 
+         # Check if speculative decoding is needed; here we always enforce it
+@@ -199,7 +201,7 @@ class NGRAMWorker:
+         )
+         batch.spec_info.prepare_for_verify(batch, self.page_size)
+ 
+-    def _update_ngram_cache(self, batch: ScheduleBatch):
++    def _update_ngram_corpus(self, batch: ScheduleBatch):
+         batch_tokens = []
+         for req in batch.reqs:
+             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
+@@ -208,10 +210,10 @@ class NGRAMWorker:
+             #     put_ids = req.origin_input_ids + req.output_ids
+             # else:
+             put_ids = self._efficient_concat_last_n(
+-                req.origin_input_ids, req.output_ids, self.branch_length
++                req.origin_input_ids, req.output_ids, self.max_trie_depth
+             )
+             batch_tokens.append(put_ids)
+-        self.ngram_cache.batch_put(batch_tokens)
++        self.ngram_corpus.batch_put(batch_tokens)
+ 
+     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+         self._prepare_for_speculative_decoding(batch)
+@@ -264,7 +266,13 @@ class NGRAMWorker:
+             accept_lens = verify_input.accept_length
+             if batch.return_logprob:
+                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
+-            self._update_ngram_cache(batch)
++            self._update_ngram_corpus(batch)
++            finished_req_ids = []
++            for req in batch.reqs:
++                if req.finished() or req.is_retracted:
++                    finished_req_ids.append(req.rid)
++            if finished_req_ids:
++                self.ngram_corpus.erase_match_state(finished_req_ids)
+             batch.forward_mode = ForwardMode.DECODE
+ 
+         else:
+diff --git a/python/sglang/test/lora_utils.py b/python/sglang/test/lora_utils.py
+index 634974f2f..0a14b1743 100644
+--- a/python/sglang/test/lora_utils.py
++++ b/python/sglang/test/lora_utils.py
+@@ -738,8 +738,6 @@ def run_lora_multiple_batch_on_model_cases(
+                 else {
+                     "speculative_algorithm": "NGRAM",
+                     "speculative_num_draft_tokens": 5,
+-                    "speculative_ngram_min_match_window_size": 2,
+-                    "speculative_ngram_max_match_window_size": 15,
+                 }
+             )
+             srt_runner = SRTRunner(
+diff --git a/python/sglang/test/runners.py b/python/sglang/test/runners.py
+index 61781fea2..b78910bd5 100644
+--- a/python/sglang/test/runners.py
++++ b/python/sglang/test/runners.py
+@@ -564,8 +564,6 @@ class SRTRunner:
+         speculative_num_steps: Optional[int] = None,
+         speculative_eagle_topk: Optional[int] = None,
+         speculative_num_draft_tokens: Optional[int] = None,
+-        speculative_ngram_min_match_window_size: Optional[int] = None,
+-        speculative_ngram_max_match_window_size: Optional[int] = None,
+         disable_overlap_schedule: bool = False,
+         disable_custom_all_reduce: bool = False,
+         torchao_config: Optional[str] = None,
+@@ -596,12 +594,7 @@ class SRTRunner:
+             spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
+         elif speculative_algorithm == "NGRAM":
+             spec_kwargs["speculative_algorithm"] = speculative_algorithm
+-            spec_kwargs["speculative_ngram_min_match_window_size"] = (
+-                speculative_ngram_min_match_window_size
+-            )
+-            spec_kwargs["speculative_ngram_max_match_window_size"] = (
+-                speculative_ngram_max_match_window_size
+-            )
++            spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
+ 
+         self.engine = Engine(
+             model_path=model_path,
+diff --git a/test/registered/spec/utils/test_ngram_corpus.py b/test/registered/spec/utils/test_ngram_corpus.py
+new file mode 100644
+index 000000000..9b40dc720
+--- /dev/null
++++ b/test/registered/spec/utils/test_ngram_corpus.py
+@@ -0,0 +1,678 @@
++import unittest
++import uuid
++
++import numpy as np
++
++from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
++
++
++def _make_corpus(match_type="BFS", **kwargs):
++    defaults = dict(
++        max_trie_depth=12,
++        min_bfs_breadth=1,
++        max_bfs_breadth=8,
++        draft_token_num=8,
++        capacity=100000,
++    )
++    defaults.update(kwargs)
++    defaults["match_type"] = match_type
++    return NgramCorpus(**defaults)
++
++
++def _batch_get(
++    corpus: NgramCorpus,
++    batch_tokens: list[list[int]],
++):
++    return corpus.batch_get(
++        req_ids=[uuid.uuid4().hex for _ in range(len(batch_tokens))],
++        batch_tokens=batch_tokens,
++        total_lens=[len(tokens) for tokens in batch_tokens],
++    )
++
++
++def _batch_get_with_state(
++    corpus: NgramCorpus,
++    req_id: str,
++    current_tokens: list[int],
++    total_len: int,
++):
++    return corpus.batch_get([req_id], [current_tokens], [total_len])
++
++
++SEED_SEQUENCES = [
++    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
++    [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
++]
++
++QUERY_SEQUENCES = [[1, 2, 3], [3, 44], [3, 6, 999]]
++
++EXPECTED_BFS_IDS = [
++    [3, 4, 44, 5, 55, 6, 66, 77],
++    [44, 55, 66, 77, 88, 99, 100, 0],
++    [999, 0, 0, 0, 0, 0, 0, 0],
++]
++
++EXPECTED_PROB_IDS = [
++    [3, 44, 4, 55, 5, 66, 6, 7],
++    [44, 55, 66, 77, 88, 99, 100, 0],
++    [999, 0, 0, 0, 0, 0, 0, 0],
++]
++
++EXPECTED_BFS_MASKS = [
++    [
++        [1, 0, 0, 0, 0, 0, 0, 0],
++        [1, 1, 0, 0, 0, 0, 0, 0],
++        [1, 0, 1, 0, 0, 0, 0, 0],
++        [1, 1, 0, 1, 0, 0, 0, 0],
++        [1, 0, 1, 0, 1, 0, 0, 0],
++        [1, 1, 0, 1, 0, 1, 0, 0],
++        [1, 0, 1, 0, 1, 0, 1, 0],
++        [1, 0, 1, 0, 1, 0, 1, 1],
++    ],
++    [
++        [1, 0, 0, 0, 0, 0, 0, 0],
++        [1, 1, 0, 0, 0, 0, 0, 0],
++        [1, 1, 1, 0, 0, 0, 0, 0],
++        [1, 1, 1, 1, 0, 0, 0, 0],
++        [1, 1, 1, 1, 1, 0, 0, 0],
++        [1, 1, 1, 1, 1, 1, 0, 0],
++        [1, 1, 1, 1, 1, 1, 1, 0],
++        [1, 0, 0, 0, 0, 0, 0, 1],
++    ],
++    [
++        [1, 0, 0, 0, 0, 0, 0, 0],
++        [1, 1, 0, 0, 0, 0, 0, 0],
++        [1, 0, 1, 0, 0, 0, 0, 0],
++        [1, 0, 0, 1, 0, 0, 0, 0],
++        [1, 0, 0, 0, 1, 0, 0, 0],
++        [1, 0, 0, 0, 0, 1, 0, 0],
++        [1, 0, 0, 0, 0, 0, 1, 0],
++        [1, 0, 0, 0, 0, 0, 0, 1],
++    ],
++]
++
++EXPECTED_PROB_MASKS = [
++    [
++        [1, 0, 0, 0, 0, 0, 0, 0],
++        [1, 1, 0, 0, 0, 0, 0, 0],
++        [1, 0, 1, 0, 0, 0, 0, 0],
++        [1, 1, 0, 1, 0, 0, 0, 0],
++        [1, 0, 1, 0, 1, 0, 0, 0],
++        [1, 1, 0, 1, 0, 1, 0, 0],
++        [1, 0, 1, 0, 1, 0, 1, 0],
++        [1, 0, 1, 0, 1, 0, 1, 1],
++    ],
++    [
++        [1, 0, 0, 0, 0, 0, 0, 0],
++        [1, 1, 0, 0, 0, 0, 0, 0],
++        [1, 1, 1, 0, 0, 0, 0, 0],
++        [1, 1, 1, 1, 0, 0, 0, 0],
++        [1, 1, 1, 1, 1, 0, 0, 0],
++        [1, 1, 1, 1, 1, 1, 0, 0],
++        [1, 1, 1, 1, 1, 1, 1, 0],
++        [1, 0, 0, 0, 0, 0, 0, 1],
++    ],
++    [
++        [1, 0, 0, 0, 0, 0, 0, 0],
++        [1, 1, 0, 0, 0, 0, 0, 0],
++        [1, 0, 1, 0, 0, 0, 0, 0],
++        [1, 0, 0, 1, 0, 0, 0, 0],
++        [1, 0, 0, 0, 1, 0, 0, 0],
++        [1, 0, 0, 0, 0, 1, 0, 0],
++        [1, 0, 0, 0, 0, 0, 1, 0],
++        [1, 0, 0, 0, 0, 0, 0, 1],
++    ],
++]
++
++
++class TestNgramCorpusBFS(CustomTestCase):
++    """Golden-output tests for BFS matching mode."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.corpus = _make_corpus("BFS")
++        cls.corpus.batch_put(SEED_SEQUENCES)
++        cls.corpus.synchronize()
++        ids, masks = _batch_get(cls.corpus, QUERY_SEQUENCES)
++        draft = 8
++        cls.ids = ids.reshape(-1, draft)
++        cls.masks = masks.reshape(-1, draft, draft)
++
++    def test_token_ids(self):
++        np.testing.assert_array_equal(self.ids.tolist(), EXPECTED_BFS_IDS)
++
++    def test_masks(self):
++        np.testing.assert_array_equal(self.masks.tolist(), EXPECTED_BFS_MASKS)
++
++    def test_output_shapes(self):
++        n_queries = len(QUERY_SEQUENCES)
++        draft = 8
++        self.assertEqual(self.ids.shape, (n_queries, draft))
++        self.assertEqual(self.masks.shape, (n_queries, draft, draft))
++
++
++class TestNgramCorpusProb(CustomTestCase):
++    """Golden-output tests for Prob matching mode."""
++
++    @classmethod
++    def setUpClass(cls):
++        cls.corpus = _make_corpus("PROB")
++        cls.corpus.batch_put(SEED_SEQUENCES)
++        cls.corpus.synchronize()
++        ids, masks = _batch_get(cls.corpus, QUERY_SEQUENCES)
++        cls.ids = ids.reshape(-1, 8)
++        cls.masks = masks.reshape(-1, 8, 8)
++
++    def test_token_ids(self):
++        np.testing.assert_array_equal(self.ids.tolist(), EXPECTED_PROB_IDS)
++
++    def test_masks(self):
++        np.testing.assert_array_equal(self.masks.tolist(), EXPECTED_PROB_MASKS)
++
++    def test_output_shapes(self):
++        n_queries = len(QUERY_SEQUENCES)
++        self.assertEqual(self.ids.shape, (n_queries, 8))
++        self.assertEqual(self.masks.shape, (n_queries, 8, 8))
++
++
++class TestNgramCorpusReset(CustomTestCase):
++    """Verify reset clears all cached state."""
++
++    def test_reset_produces_empty_results(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put(SEED_SEQUENCES)
++        corpus.synchronize()
++
++        ids_before, _ = _batch_get(corpus, [[1, 2, 3]])
++        self.assertTrue(
++            any(t != 0 for t in ids_before.tolist()[1:]),
++            "Expected non-trivial draft tokens before reset",
++        )
++
++        corpus.reset()
++
++        ids_after, _ = _batch_get(corpus, [[1, 2, 3]])
++        self.assertEqual(
++            ids_after.tolist(),
++            [3, 0, 0, 0, 0, 0, 0, 0],
++            "After reset, only last_token should be present (rest zero-padded)",
++        )
++
++
++class TestNgramCorpusNoMatch(CustomTestCase):
++    """Verify behavior when query has no match in the corpus."""
++
++    def test_unmatched_query(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put([[10, 20, 30, 40, 50]])
++        corpus.synchronize()
++
++        ids, masks = _batch_get(corpus, [[999, 888, 777]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 777, "First token should be last context token")
++        self.assertTrue(
++            all(t == 0 for t in ids_list[1:]),
++            "No draft tokens expected when nothing matches",
++        )
++
++    def test_empty_corpus(self):
++        corpus = _make_corpus("BFS")
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 3)
++        self.assertTrue(all(t == 0 for t in ids_list[1:]))
++
++
++class TestNgramCorpusMultipleInserts(CustomTestCase):
++    """Verify that multiple inserts accumulate correctly."""
++
++    def test_incremental_inserts(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put([[1, 2, 3, 4, 5]])
++        corpus.synchronize()
++
++        corpus.batch_put([[1, 2, 3, 44, 55]])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++
++        self.assertIn(4, ids_list, "Token 4 from first insert should still match")
++        self.assertIn(44, ids_list, "Token 44 from second insert should also match")
++
++
++class TestNgramCorpusSqueeze(CustomTestCase):
++    """Verify cache eviction under memory pressure."""
++
++    def test_small_capacity_does_not_crash(self):
++        corpus = _make_corpus("BFS", capacity=200)
++        long_seq = list(range(1, 101))
++        corpus.batch_put([long_seq])
++        corpus.synchronize()
++
++        ids, masks = _batch_get(corpus, [[50, 51, 52]])
++        self.assertEqual(len(ids), 8, "Should still produce draft_token_num outputs")
++
++    def test_eviction_preserves_recent(self):
++        corpus = _make_corpus("BFS", capacity=500, max_trie_depth=6)
++
++        old_seq = list(range(1000, 1050))
++        corpus.batch_put([old_seq])
++        corpus.synchronize()
++
++        recent_seq = list(range(2000, 2050))
++        corpus.batch_put([recent_seq])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[2000, 2001, 2002]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 2002, "Last context token should be first")
++        self.assertIn(2003, ids_list, "Recent sequence should still be matchable")
++
++
++class TestNgramCorpusLeafPaths(CustomTestCase):
++    """Verify the leaf_paths_from_mask utility."""
++
++    def test_simple_tree(self):
++        corpus = _make_corpus("BFS")
++        tokens = [3, 4, 44, 5, 55]
++        mask = [
++            [1, 0, 0, 0, 0],
++            [1, 1, 0, 0, 0],
++            [1, 0, 1, 0, 0],
++            [1, 1, 0, 1, 0],
++            [1, 0, 1, 0, 1],
++        ]
++        paths = corpus.leaf_paths_from_mask(tokens, mask)
++
++        for path in paths:
++            self.assertIn(3, path, "Root token should be in every path")
++
++        self.assertEqual(len(paths), 2, "Two leaf paths expected for a binary tree")
++
++    def test_single_chain(self):
++        corpus = _make_corpus("BFS")
++        tokens = [10, 20, 30]
++        mask = [
++            [1, 0, 0],
++            [1, 1, 0],
++            [1, 1, 1],
++        ]
++        paths = corpus.leaf_paths_from_mask(tokens, mask)
++        self.assertEqual(len(paths), 1)
++        self.assertEqual(paths[0], [10, 20, 30])
++
++
++class TestNgramCorpusBatchConsistency(CustomTestCase):
++    """Verify batch queries produce same results as individual queries."""
++
++    def test_batch_vs_individual(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put(SEED_SEQUENCES)
++        corpus.synchronize()
++
++        batch_ids, batch_masks = _batch_get(corpus, QUERY_SEQUENCES)
++        draft = 8
++        batch_ids = batch_ids.reshape(-1, draft)
++        batch_masks = batch_masks.reshape(-1, draft, draft)
++
++        for i, query in enumerate(QUERY_SEQUENCES):
++            single_ids, single_masks = _batch_get(corpus, [query])
++            single_ids = single_ids.reshape(-1, draft)
++            single_masks = single_masks.reshape(-1, draft, draft)
++
++            np.testing.assert_array_equal(
++                batch_ids[i],
++                single_ids[0],
++                err_msg=f"Token mismatch for query {i}",
++            )
++            np.testing.assert_array_equal(
++                batch_masks[i],
++                single_masks[0],
++                err_msg=f"Mask mismatch for query {i}",
++            )
++
++
++class TestMaskValidity(CustomTestCase):
++    """Verify structural invariants of the output mask for any draft tree."""
++
++    def _check_mask(self, masks_2d):
++        n = len(masks_2d)
++        for i in range(n):
++            self.assertEqual(masks_2d[i][i], 1, f"Diagonal must be 1 at row {i}")
++        self.assertEqual(masks_2d[0], [1] + [0] * (n - 1))
++
++    def test_bfs_mask_invariants(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put(SEED_SEQUENCES)
++        corpus.synchronize()
++        _, masks = _batch_get(corpus, QUERY_SEQUENCES)
++        masks = masks.reshape(-1, 8, 8)
++        for i in range(masks.shape[0]):
++            self._check_mask(masks[i].tolist())
++
++    def test_prob_mask_invariants(self):
++        corpus = _make_corpus("PROB")
++        corpus.batch_put(SEED_SEQUENCES)
++        corpus.synchronize()
++        _, masks = _batch_get(corpus, QUERY_SEQUENCES)
++        masks = masks.reshape(-1, 8, 8)
++        for i in range(masks.shape[0]):
++            self._check_mask(masks[i].tolist())
++
++
++class TestFrequencyBoosting(CustomTestCase):
++    """Verify that repeated insertions change Prob-mode selection."""
++
++    def test_repeated_insert_promotes_token(self):
++        corpus = _make_corpus(
++            "PROB",
++            draft_token_num=2,
++            max_bfs_breadth=1,
++            min_bfs_breadth=1,
++            max_trie_depth=5,
++        )
++        corpus.batch_put([[1, 2, 3, 10, 11]])
++        corpus.synchronize()
++
++        for _ in range(10):
++            corpus.batch_put([[1, 2, 3, 20, 21]])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++
++        self.assertEqual(
++            ids_list[1],
++            20,
++            f"Token 20 should be selected over 10 after frequency boost, got {ids_list}",
++        )
++
++
++class TestRecencyOrdering(CustomTestCase):
++    """Verify that BFS mode respects LRU recency."""
++
++    def test_most_recent_insert_selected(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=2,
++            max_bfs_breadth=1,
++            min_bfs_breadth=1,
++            max_trie_depth=5,
++        )
++        corpus.batch_put([[1, 2, 3, 10, 11]])
++        corpus.synchronize()
++        corpus.batch_put([[1, 2, 3, 20, 21]])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++        self.assertEqual(
++            ids_list[1],
++            20,
++            f"Token 20 (recent) should be selected over 10 (old), got {ids_list}",
++        )
++
++
++class TestOverlappingSuffixes(CustomTestCase):
++    """Verify correct matching when sequences share suffixes."""
++
++    def test_shared_suffix_both_match(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put([[100, 200, 7, 8, 9, 50, 51]])
++        corpus.batch_put([[300, 400, 7, 8, 9, 60, 61]])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[7, 8, 9]])
++        ids_list = ids.tolist()
++        self.assertIn(50, ids_list, "Continuation from first sequence missing")
++        self.assertIn(60, ids_list, "Continuation from second sequence missing")
++
++
++class TestSingleTokenContext(CustomTestCase):
++    """Verify behavior with minimum-length context."""
++
++    def test_single_token_query(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put([[5, 10, 20, 30]])
++        corpus.synchronize()
++
++        ids, masks = _batch_get(corpus, [[5]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 5, "First token should be last context token")
++        self.assertIn(10, ids_list, "Should match continuation after single token 5")
++
++
++class TestLongContext(CustomTestCase):
++    """Verify behavior when query context exceeds max_trie_depth."""
++
++    def test_context_longer_than_max_trie_depth(self):
++        corpus = _make_corpus("BFS", max_trie_depth=6)
++        seq = list(range(1, 20))
++        corpus.batch_put([seq])
++        corpus.synchronize()
++
++        long_query = list(range(1, 16))
++        ids, masks = _batch_get(corpus, [long_query])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 15, "First token should be last context token")
++        self.assertIn(16, ids_list, "Should match via suffix despite long context")
++
++    def test_matches_longest_stored_suffix(self):
++        corpus = _make_corpus("BFS", max_trie_depth=6, draft_token_num=4)
++        corpus.batch_put([[1, 2, 3, 4, 5, 6, 7]])
++        corpus.batch_put([[99, 3, 4, 5, 6, 8]])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[2, 3, 4, 5, 6]])
++        ids_list = ids.tolist()
++        self.assertIn(
++            7, ids_list, "Longest stored suffix should contribute a continuation"
++        )
++        self.assertIn(
++            8,
++            ids_list,
++            "Shorter matching suffixes should still contribute continuations",
++        )
++
++
++class TestDraftBudgetSaturation(CustomTestCase):
++    """Verify the draft tree uses exactly draft_token_num slots."""
++
++    def test_full_budget_used(self):
++        corpus = _make_corpus("BFS", draft_token_num=8)
++        seq = list(range(1, 30))
++        corpus.batch_put([seq])
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++        self.assertEqual(len(ids_list), 8)
++        non_zero = [t for t in ids_list[1:] if t != 0]
++        self.assertGreater(
++            len(non_zero),
++            0,
++            "Draft budget should have non-zero tokens when cache has long chains",
++        )
++
++
++class TestTruncate(CustomTestCase):
++    """Verify truncation logic on batch_get output."""
++
++    def test_truncate_reduces_output(self):
++        corpus = _make_corpus("BFS", draft_token_num=8)
++        corpus.batch_put(SEED_SEQUENCES)
++        corpus.synchronize()
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids = ids.reshape(8)
++        self.assertEqual(len(ids), 8)
++
++        # Simulate truncate to 4
++        trunc_n = 4
++        trunc_ids = ids[:trunc_n]
++        self.assertEqual(len(trunc_ids), trunc_n)
++
++    def test_truncate_preserves_mask_structure(self):
++        corpus = _make_corpus("BFS", draft_token_num=8)
++        corpus.batch_put(SEED_SEQUENCES)
++        corpus.synchronize()
++
++        _, masks = _batch_get(corpus, [[1, 2, 3]])
++        n = 8
++        full_mask = masks.reshape(n, n)
++
++        trunc_n = 4
++        trunc_mask = full_mask[:trunc_n, :trunc_n]
++
++        for i in range(trunc_n):
++            for j in range(trunc_n):
++                self.assertEqual(
++                    trunc_mask[i, j],
++                    full_mask[i, j],
++                    f"Mask mismatch at ({i},{j})",
++                )
++
++
++class TestResetAndReinsert(CustomTestCase):
++    """Verify that reset followed by new inserts works correctly."""
++
++    def test_reset_then_reinsert(self):
++        corpus = _make_corpus("BFS")
++        corpus.batch_put([[1, 2, 3, 4, 5]])
++        corpus.synchronize()
++
++        corpus.reset()
++
++        corpus.batch_put([[10, 20, 30, 40, 50]])
++        corpus.synchronize()
++
++        ids_old, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids_old_list = ids_old.tolist()
++        self.assertTrue(
++            all(t == 0 for t in ids_old_list[1:]),
++            f"Old data should not match after reset+reinsert, got {ids_old_list}",
++        )
++
++        ids_new, _ = _batch_get(corpus, [[10, 20, 30]])
++        ids_new_list = ids_new.tolist()
++        self.assertEqual(ids_new_list[0], 30)
++        self.assertIn(40, ids_new_list, "New data should match after reset+reinsert")
++
++
++class TestSqueezeEvictsOld(CustomTestCase):
++    """Verify that squeeze actually evicts old data, not just preserves recent."""
++
++    def test_old_data_evicted(self):
++        corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6)
++
++        old_seq = list(range(5000, 5030))
++        corpus.batch_put([old_seq])
++        corpus.synchronize()
++
++        ids_before, _ = _batch_get(corpus, [[5000, 5001, 5002]])
++        self.assertIn(
++            5003,
++            ids_before.tolist(),
++            "Old data should match before eviction",
++        )
++
++        for i in range(5):
++            new_seq = list(range(6000 + i * 30, 6000 + i * 30 + 30))
++            corpus.batch_put([new_seq])
++            corpus.synchronize()
++
++        ids_after, _ = _batch_get(corpus, [[5000, 5001, 5002]])
++        ids_after_list = ids_after.tolist()
++        self.assertNotIn(
++            5003,
++            ids_after_list,
++            f"Old data should be evicted after pressure, got {ids_after_list}",
++        )
++
++
++class TestNgramCorpusIncremental(CustomTestCase):
++    """Verify the incremental matching path matches the stateless path."""
++
++    def _assert_incremental_matches_stateless(self, match_type: str):
++        corpus = _make_corpus(match_type, max_trie_depth=4, draft_token_num=4)
++        corpus.batch_put([[1, 2, 3, 4, 5, 6], [9, 3, 4, 7, 8]])
++        corpus.synchronize()
++
++        req_id = f"req-{match_type.lower()}"
++
++        steps = [
++            [1, 2, 3],
++            [1, 2, 3, 4],
++            [1, 2, 3, 4, 5, 6],
++        ]
++        for full_sequence in steps:
++            current_tail = full_sequence[-4:]
++            inc_ids, inc_masks = _batch_get_with_state(
++                corpus,
++                req_id,
++                current_tail,
++                len(full_sequence),
++            )
++            full_ids, full_masks = _batch_get(corpus, [current_tail])
++            np.testing.assert_array_equal(inc_ids, full_ids)
++            np.testing.assert_array_equal(inc_masks, full_masks)
++
++    def test_incremental_matches_stateless_bfs(self):
++        self._assert_incremental_matches_stateless("BFS")
++
++    def test_incremental_matches_stateless_prob(self):
++        self._assert_incremental_matches_stateless("PROB")
++
++    def test_leaf_anchor_becomes_expandable(self):
++        corpus = _make_corpus("BFS", max_trie_depth=4, draft_token_num=4)
++        corpus.batch_put([[1, 2, 3]])
++        corpus.synchronize()
++
++        req_id = "leaf-anchor"
++        ids_before, _ = _batch_get_with_state(corpus, req_id, [2, 3], 2)
++        self.assertTrue(
++            all(t == 0 for t in ids_before.tolist()[1:]),
++            f"Expected only the last token before extension, got {ids_before.tolist()}",
++        )
++
++        corpus.batch_put([[9, 2, 3, 4]])
++        corpus.synchronize()
++
++        inc_ids, inc_masks = _batch_get_with_state(corpus, req_id, [2, 3], 2)
++        full_ids, full_masks = _batch_get(corpus, [[2, 3]])
++        np.testing.assert_array_equal(inc_ids, full_ids)
++        np.testing.assert_array_equal(inc_masks, full_masks)
++        self.assertIn(
++            4,
++            inc_ids.tolist(),
++            f"Expected token 4 after extension, got {inc_ids.tolist()}",
++        )
++
++    def test_stale_state_rebuilds_after_eviction(self):
++        corpus = _make_corpus("BFS", capacity=150, max_trie_depth=6, draft_token_num=4)
++        corpus.batch_put([list(range(5000, 5030))])
++        corpus.synchronize()
++
++        req_id = "evicted"
++        _batch_get_with_state(corpus, req_id, [5000, 5001, 5002], 3)
++
++        for i in range(5):
++            new_seq = list(range(6000 + i * 30, 6000 + i * 30 + 30))
++            corpus.batch_put([new_seq])
++            corpus.synchronize()
++
++        inc_ids, inc_masks = _batch_get_with_state(
++            corpus, req_id, [5000, 5001, 5002], 3
++        )
++        full_ids, full_masks = _batch_get(corpus, [[5000, 5001, 5002]])
++        np.testing.assert_array_equal(inc_ids, full_ids)
++        np.testing.assert_array_equal(inc_masks, full_masks)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=3)

@@ -1,0 +1,321 @@
+diff --git a/python/sglang/srt/lora/backend/chunked_backend.py b/python/sglang/srt/lora/backend/chunked_backend.py
+index 91b160c476f4..7a47d10cdd76 100644
+--- a/python/sglang/srt/lora/backend/chunked_backend.py
++++ b/python/sglang/srt/lora/backend/chunked_backend.py
+@@ -273,6 +273,8 @@ def prepare_lora_batch(
+             weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+         )
+         req_seg_indptr_cpu = self._build_req_seg_indptr(forward_batch)
++        max_num_segments = 0
++        has_unused_cuda_graph_segments = False
+ 
+         if not use_cuda_graph:
+             batch_info = LoRABatchInfo(
+@@ -308,6 +310,8 @@ def prepare_lora_batch(
+             batch_info.bs = bs
+             batch_info.num_segments = num_segments
+             batch_info.max_len = chunk_size
++            max_num_segments = batch_info.weight_indices.shape[0]
++            has_unused_cuda_graph_segments = num_segments < max_num_segments
+ 
+         # Copy to device asynchronously
+         batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
+@@ -319,7 +323,13 @@ def prepare_lora_batch(
+         batch_info.weight_indices[:num_segments].copy_(
+             seg_weight_indices, non_blocking=True
+         )
++        if has_unused_cuda_graph_segments:
++            batch_info.weight_indices[num_segments:max_num_segments].zero_()
+         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
++        if has_unused_cuda_graph_segments:
++            batch_info.seg_indptr[num_segments + 1 : max_num_segments + 1].fill_(
++                int(seg_indptr[-1])
++            )
+         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
+         batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
+         batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
+diff --git a/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py b/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py
+index bf3cdbe30fde..d8a6406fea8b 100644
+--- a/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py
++++ b/python/sglang/srt/lora/triton_ops/chunked_embedding_lora_a.py
+@@ -5,7 +5,7 @@
+ from sglang.srt.lora.utils import LoRABatchInfo
+ 
+ 
+-@triton.jit
++@triton.jit(do_not_specialize=["num_segments"])
+ def _chunked_embedding_lora_a_kernel(
+     # Pointers to tensors
+     input_ids,
+@@ -39,6 +39,10 @@ def _chunked_embedding_lora_a_kernel(
+     # If chunk id is larger than actual number of chunks, skip
+     if chunk_idx >= num_segments:
+         return
++    chunk_start = tl.load(seg_indptr + chunk_idx)
++    chunk_end = tl.load(seg_indptr + chunk_idx + 1)
++    if chunk_start == chunk_end:
++        return
+     # Load LoRA adapter index for this segment, then look up the rank
+     lora_index = tl.load(weight_indices + chunk_idx)
+     rank_val = tl.load(lora_ranks + lora_index)
+@@ -46,8 +50,6 @@ def _chunked_embedding_lora_a_kernel(
+     if rank_val == 0:
+         return
+     # for each token in chunk, load embedding across rank dimension
+-    chunk_start = tl.load(seg_indptr + chunk_idx)
+-    chunk_end = tl.load(seg_indptr + chunk_idx + 1)
+     for c in range(chunk_start, chunk_end):
+         s_index = tl.load(permutation + c)
+         # Load the token ID
+@@ -108,8 +110,13 @@ def chunked_embedding_lora_a_forward(
+     # Block size for rank dimension
+     BLOCK_RANK = 128
+     num_segments = batch_info.num_segments
++    segment_grid = (
++        batch_info.weight_indices.shape[0]
++        if batch_info.use_cuda_graph
++        else num_segments
++    )
+     # 1D Grid: one program per chunk of embedding lookup work
+-    grid = (batch_info.bs if batch_info.use_cuda_graph else num_segments,)
++    grid = (segment_grid,)
+     output = torch.zeros((S, rank), device=input_ids.device, dtype=weights.dtype)
+ 
+     _chunked_embedding_lora_a_kernel[grid](
+@@ -127,7 +134,7 @@ def chunked_embedding_lora_a_forward(
+         batch_info.seg_indptr,
+         batch_info.weight_indices,
+         batch_info.lora_ranks,
+-        batch_info.num_segments,
++        segment_grid,
+         batch_info.permutation,
+         BLOCK_RANK,
+     )
+diff --git a/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py b/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py
+index 50830be5a265..e1968ff994ca 100644
+--- a/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py
++++ b/python/sglang/srt/lora/triton_ops/chunked_sgmv_expand.py
+@@ -67,6 +67,11 @@ def _chunked_lora_expand_kernel(
+     if pid_s >= num_segs:
+         return
+ 
++    seg_start = tl.load(seg_indptr + pid_s)
++    seg_end = tl.load(seg_indptr + pid_s + 1)
++    if seg_start == seg_end:
++        return
++
+     # Current block computes sequence with batch_id,
+     # which starts from row seg_start of x with length seg_len.
+     # qkv_id decides which of q,k,v to compute (0: q, 1: k, 2: v)
+@@ -77,9 +82,6 @@ def _chunked_lora_expand_kernel(
+     if cur_rank == 0:
+         return
+ 
+-    seg_start = tl.load(seg_indptr + pid_s)
+-    seg_end = tl.load(seg_indptr + pid_s + 1)
+-
+     slice_id = tl.program_id(axis=1)
+     slice_start = tl.load(slice_offsets + slice_id)
+     slice_end = tl.load(slice_offsets + slice_id + 1)
+@@ -91,7 +93,7 @@ def _chunked_lora_expand_kernel(
+     # Map logical sequence index to physical index
+     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
+     s_offset_physical = tl.load(
+-        permutation + s_offset_logical, mask=s_offset_logical < seg_end
++        permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
+     )
+ 
+     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
+@@ -184,11 +186,16 @@ def chunked_sgmv_lora_expand_forward(
+     BLOCK_N = config["BLOCK_N"]
+ 
+     num_segments = batch_info.num_segments
++    segment_grid = (
++        batch_info.weight_indices.shape[0]
++        if batch_info.use_cuda_graph
++        else num_segments
++    )
+ 
+     grid = (
+         triton.cdiv(max_slice_size, BLOCK_N),
+         num_slices,  # number of slices in the input/output
+-        batch_info.bs if batch_info.use_cuda_graph else num_segments,
++        segment_grid,
+     )
+ 
+     if base_output is None:
+@@ -215,7 +222,7 @@ def chunked_sgmv_lora_expand_forward(
+         weight_indices=batch_info.weight_indices,
+         lora_ranks=batch_info.lora_ranks,
+         permutation=batch_info.permutation,
+-        num_segs=num_segments,
++        num_segs=segment_grid,
+         scalings=batch_info.scalings,
+         slice_offsets=slice_offsets,
+         # constants
+diff --git a/python/sglang/srt/lora/triton_ops/chunked_sgmv_shrink.py b/python/sglang/srt/lora/triton_ops/chunked_sgmv_shrink.py
+index e625588aaf43..8788a65de1a5 100644
+--- a/python/sglang/srt/lora/triton_ops/chunked_sgmv_shrink.py
++++ b/python/sglang/srt/lora/triton_ops/chunked_sgmv_shrink.py
+@@ -61,6 +61,11 @@ def _chunked_lora_shrink_kernel(
+ 
+     pid_n = tl.program_id(0)
+ 
++    seg_start = tl.load(seg_indptr + pid_s)
++    seg_end = tl.load(seg_indptr + pid_s + 1)
++    if seg_start == seg_end:
++        return
++
+     # Current block computes sequence with batch_id,
+     # which starts from row seg_start of x with length seg_len
+     w_index = tl.load(weight_indices + pid_s)
+@@ -70,16 +75,13 @@ def _chunked_lora_shrink_kernel(
+     if rank == 0:
+         return
+ 
+-    seg_start = tl.load(seg_indptr + pid_s)
+-    seg_end = tl.load(seg_indptr + pid_s + 1)
+-
+     # Adjust N dim according to the specific LoRA adapter
+     cur_n = tl.minimum(N, rank * NUM_SLICES)
+ 
+     # Map logical sequence index to physical index
+     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
+     s_offset_physical = tl.load(
+-        permutation + s_offset_logical, mask=s_offset_logical < seg_end
++        permutation + s_offset_logical, mask=s_offset_logical < seg_end, other=0
+     )
+ 
+     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
+@@ -154,9 +156,14 @@ def chunked_sgmv_lora_shrink_forward(
+     assert x.shape[-1] == K
+ 
+     num_segments = batch_info.num_segments
++    segment_grid = (
++        batch_info.weight_indices.shape[0]
++        if batch_info.use_cuda_graph
++        else num_segments
++    )
+     grid = (
+         triton.cdiv(N, BLOCK_N),
+-        batch_info.bs if batch_info.use_cuda_graph else num_segments,
++        segment_grid,
+     )
+ 
+     # Optional launch params from tuned config
+@@ -175,7 +182,7 @@ def chunked_sgmv_lora_shrink_forward(
+         weight_indices=batch_info.weight_indices,
+         lora_ranks=batch_info.lora_ranks,
+         permutation=batch_info.permutation,
+-        num_segs=num_segments,
++        num_segs=segment_grid,
+         # constants
+         N=N,
+         K=K,
+diff --git a/python/sglang/srt/lora/triton_ops/kv_b_lora_absorbed.py b/python/sglang/srt/lora/triton_ops/kv_b_lora_absorbed.py
+index c1942c85e87a..e4ed6a35b795 100644
+--- a/python/sglang/srt/lora/triton_ops/kv_b_lora_absorbed.py
++++ b/python/sglang/srt/lora/triton_ops/kv_b_lora_absorbed.py
+@@ -90,7 +90,11 @@ def _max_segment_len(batch_info: LoRABatchInfo) -> int:
+ 
+ 
+ def _segment_grid_size(batch_info: LoRABatchInfo, num_segments: int) -> int:
+-    return batch_info.bs if batch_info.use_cuda_graph else num_segments
++    return (
++        batch_info.weight_indices.shape[0]
++        if batch_info.use_cuda_graph
++        else num_segments
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -273,7 +277,7 @@ def step_a_q_fwd(
+         batch_info.weight_indices,
+         batch_info.lora_ranks,
+         batch_info.permutation,
+-        num_segments,
++        segment_grid,
+         FULL_K=full_K_per_head,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+         BLOCK_S=_BLOCK_S,
+@@ -462,7 +466,7 @@ def step_b_q_fwd(
+         batch_info.lora_ranks,
+         batch_info.permutation,
+         batch_info.scalings,
+-        num_segments,
++        segment_grid,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+         BLOCK_S=_BLOCK_S,
+         BLOCK_N=_STEP_B_BLOCK_N,
+@@ -641,7 +645,7 @@ def step_a_v_fwd(
+         batch_info.weight_indices,
+         batch_info.lora_ranks,
+         batch_info.permutation,
+-        num_segments,
++        segment_grid,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+         BLOCK_S=_BLOCK_S,
+         BLOCK_N=_STEP_A_BLOCK_N,
+@@ -838,7 +842,7 @@ def step_b_v_fwd(
+         batch_info.lora_ranks,
+         batch_info.permutation,
+         batch_info.scalings,
+-        num_segments,
++        segment_grid,
+         FULL_K=full_K_per_head,
+         QK_NOPE_OFFSET=qk_nope_head_dim,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+diff --git a/python/sglang/srt/lora/trtllm_lora_temp/triton_ops/kv_b_lora_absorbed.py b/python/sglang/srt/lora/trtllm_lora_temp/triton_ops/kv_b_lora_absorbed.py
+index e6af8ba6fea1..1f6adca7ce5c 100644
+--- a/python/sglang/srt/lora/trtllm_lora_temp/triton_ops/kv_b_lora_absorbed.py
++++ b/python/sglang/srt/lora/trtllm_lora_temp/triton_ops/kv_b_lora_absorbed.py
+@@ -90,7 +90,11 @@ def _max_segment_len(batch_info: LoRABatchInfo) -> int:
+ 
+ 
+ def _segment_grid_size(batch_info: LoRABatchInfo, num_segments: int) -> int:
+-    return batch_info.bs if batch_info.use_cuda_graph else num_segments
++    return (
++        batch_info.weight_indices.shape[0]
++        if batch_info.use_cuda_graph
++        else num_segments
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -297,7 +301,7 @@ def step_a_q_fwd(
+         batch_info.weight_indices,
+         batch_info.lora_ranks,
+         batch_info.permutation,
+-        num_segments,
++        segment_grid,
+         FULL_K=full_K_per_head,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+         K_DIV=(qk_nope_dim % _STEP_A_Q_BLOCK_K == 0),
+@@ -521,7 +525,7 @@ def step_b_q_fwd(
+         batch_info.lora_ranks,
+         batch_info.permutation,
+         batch_info.scalings,
+-        num_segments,
++        segment_grid,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+         N_DIV=(kv_lora_rank % _STEP_B_Q_BLOCK_N == 0),
+         BLOCK_S=_BLOCK_S,
+@@ -726,7 +730,7 @@ def step_a_v_fwd(
+         batch_info.weight_indices,
+         batch_info.lora_ranks,
+         batch_info.permutation,
+-        num_segments,
++        segment_grid,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+         K_DIV=(kv_lora_rank % _STEP_A_V_BLOCK_K == 0),
+         BLOCK_S=_BLOCK_S,
+@@ -939,7 +943,7 @@ def step_b_v_fwd(
+         batch_info.lora_ranks,
+         batch_info.permutation,
+         batch_info.scalings,
+-        num_segments,
++        segment_grid,
+         FULL_K=full_K_per_head,
+         QK_NOPE_OFFSET=qk_nope_head_dim,
+         SORTED_BY_ADAPTER=sorted_by_adapter,
+

@@ -1,0 +1,1 @@
+test/registered/models/test_transformers5_quantized_rmsnorm_serving.py::test_layer_c_optimized_hf_order_beats_native_fallback

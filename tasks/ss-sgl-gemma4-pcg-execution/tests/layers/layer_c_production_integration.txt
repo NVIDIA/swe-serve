@@ -1,0 +1,1 @@
+test/registered/models/test_gemma4_pcg_execution.py::test_real_image_serving_preserves_active_pcg

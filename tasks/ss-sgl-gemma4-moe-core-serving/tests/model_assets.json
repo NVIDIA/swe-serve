@@ -1,0 +1,90 @@
+{
+  "schema_version": 2,
+  "assets": {
+    "moe_native": {
+      "kind": "authentic_public_checkpoint",
+      "repository": "google/gemma-4-26B-A4B-it",
+      "revision": "4c55b528bdc40b4e79ed7fd4e2f8e46fa5aaed5a",
+      "license": "gemma",
+      "parameter_count": 26544131376,
+      "active_parameter_count": 4000000000,
+      "model_path_env": "GEMMA4_MOE_MODEL",
+      "config_model_type": "gemma4",
+      "config_architecture": "Gemma4ForConditionalGeneration",
+      "num_experts": 128,
+      "num_experts_per_token": 8,
+      "runtime_files": [
+        "chat_template.jinja",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json"
+      ],
+      "weight_size_bytes": 51612009916,
+      "weight_shards": [
+        {
+          "file": "model-00001-of-00002.safetensors",
+          "size_bytes": 49907246508,
+          "sha256": "1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3"
+        },
+        {
+          "file": "model-00002-of-00002.safetensors",
+          "size_bytes": 1704763408,
+          "sha256": "aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7"
+        }
+      ]
+    }
+  },
+  "common_assets": ["moe_native"],
+  "fixtures": {
+    "solid_red_png": {
+      "media_type": "image/png",
+      "semantic_contract": "deterministically generated 256x256 solid red RGB image"
+    }
+  },
+  "profiles": {
+    "h100_1": {
+      "gpu_family": "hopper",
+      "gpu_name_contains": "H100",
+      "allocation_gpus": 1,
+      "tp_size": 1,
+      "primary_asset": "moe_native",
+      "server_args": []
+    },
+    "h100_4": {
+      "gpu_family": "hopper",
+      "gpu_name_contains": "H100",
+      "allocation_gpus": 4,
+      "tp_size": 4,
+      "primary_asset": "moe_native",
+      "server_args": []
+    },
+    "gb200_1_logical": {
+      "gpu_family": "blackwell",
+      "gpu_name_contains": "GB200",
+      "allocation_gpus": 4,
+      "logical_gpus": 1,
+      "tp_size": 1,
+      "primary_asset": "moe_native",
+      "server_args": []
+    },
+    "gb200_4": {
+      "gpu_family": "blackwell",
+      "gpu_name_contains": "GB200",
+      "allocation_gpus": 4,
+      "tp_size": 4,
+      "primary_asset": "moe_native",
+      "server_args": []
+    },
+    "gb300_1": {
+      "gpu_family": "blackwell",
+      "gpu_name_contains": "GB300",
+      "allocation_gpus": 1,
+      "tp_size": 1,
+      "primary_asset": "moe_native",
+      "server_args": []
+    }
+  }
+}

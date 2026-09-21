@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl20960-sparse-embed-overrides-v2",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/20960"
+  ]
+}

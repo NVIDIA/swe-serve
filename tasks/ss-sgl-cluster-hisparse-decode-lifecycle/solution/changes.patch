@@ -1,0 +1,304 @@
+diff --git a/python/sglang/srt/managers/hisparse_coordinator.py b/python/sglang/srt/managers/hisparse_coordinator.py
+index 89740f7368..e9a3c88346 100644
+--- a/python/sglang/srt/managers/hisparse_coordinator.py
++++ b/python/sglang/srt/managers/hisparse_coordinator.py
+@@ -51,10 +51,11 @@ class HiSparseCoordinator:
+             device_pool=self.mem_pool_device,
+             host_to_device_ratio=host_to_device_ratio,
+             host_size=0,
+-            page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
++            page_size=self.mem_pool_device.page_size,
+             layout="layer_first",
+             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+         )
++        self.page_size = self.mem_pool_device.page_size
+ 
+         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
+         max_context_len = req_to_token_pool.max_context_len
+@@ -71,11 +72,14 @@ class HiSparseCoordinator:
+             max_num_reqs, dtype=torch.int64, device="cpu"
+         )
+         self.req_to_host_pool = torch.full(
+-            (max_num_reqs, max_context_len),
++            (max_num_reqs, max_context_len + self.page_size),
+             -1,
+             dtype=torch.int64,
+             device=device,
+         )
++        self.req_to_host_pool_allocated_len = torch.zeros(
++            max_num_reqs, dtype=torch.int64, device="cpu"
++        )
+ 
+         self.write_staging_stream = device_module.Stream()
+         self.ack_staging_queue: List[HiSparseAct] = []
+@@ -132,18 +136,13 @@ class HiSparseCoordinator:
+         )
+ 
+         prefill_len = len(device_indices)
+-        host_indices = self.mem_pool_host.alloc(prefill_len)
+-        if host_indices is None:
+-            logger.error(
+-                "HiSparse: host mem pool alloc failed for %d tokens (req %s)",
+-                prefill_len,
+-                req.rid,
+-            )
+-            raise RuntimeError(
+-                f"HiSparse host mem pool alloc failed for {prefill_len} tokens"
+-            )
+-        host_indices = host_indices.to(device=self.device)
+-        self.req_to_host_pool[req.req_pool_idx, :prefill_len] = host_indices
++        host_indices = self.mem_pool_host.alloc_paged_token_slots(
++            self.req_to_host_pool,
++            self.req_to_host_pool_allocated_len,
++            req.req_pool_idx,
++            0,
++            prefill_len,
++        )
+ 
+         start_event = device_module.Event()
+         finish_event = device_module.Event()
+@@ -419,17 +418,19 @@ class HiSparseCoordinator:
+         backup_req_indices = req_pool_indices[backup_indices_gpu]
+         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
+ 
+-        host_locs = self.mem_pool_host.alloc(len(device_locs))
+-        if host_locs is None:
+-            logger.error(
+-                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
+-                len(device_locs),
+-            )
+-            raise RuntimeError(
+-                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
++        host_locs_list = []
++        for i in backup_indices:
++            req_idx = int(req_pool_indices_cpu[i])
++            start_pos = int(seq_lens_cpu[i]) - 2
++            host_locs = self.mem_pool_host.alloc_paged_token_slots(
++                self.req_to_host_pool,
++                self.req_to_host_pool_allocated_len,
++                req_idx,
++                start_pos,
++                1,
+             )
+-        host_locs = host_locs.to(device=self.device)
+-        self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
++            host_locs_list.append(host_locs)
++        host_locs = torch.cat(host_locs_list)
+ 
+         self.mem_pool_host.backup_from_device_all_layer(
+             self.mem_pool_device,
+@@ -551,11 +552,15 @@ class HiSparseCoordinator:
+         self.write_staging_stream.synchronize()
+ 
+         # Free host memory that was allocated during admit_request_into_staging
+-        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
+-        host_indices = host_indices[host_indices >= 0]
++        host_indices = self.mem_pool_host.allocated_host_indices(
++            self.req_to_host_pool,
++            req.req_pool_idx,
++            self.req_to_host_pool_allocated_len[req.req_pool_idx],
++        )
+         if host_indices.numel() > 0:
+             self.mem_pool_host.free(host_indices)
+         self.req_to_host_pool[req.req_pool_idx, :] = -1
++        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+         self._skip_first_backup[req.req_pool_idx] = False
+         req.hisparse_staging = False
+ 
+@@ -582,8 +587,11 @@ class HiSparseCoordinator:
+             allocated_locs
+         ] = 0
+ 
+-        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
+-        host_indices = host_indices[host_indices >= 0]
++        host_indices = self.mem_pool_host.allocated_host_indices(
++            self.req_to_host_pool,
++            req.req_pool_idx,
++            self.req_to_host_pool_allocated_len[req.req_pool_idx],
++        )
+         if host_indices.numel() > 0:
+             self.mem_pool_host.free(host_indices)
+         # clear req info
+@@ -592,6 +600,7 @@ class HiSparseCoordinator:
+         self.req_to_device_buffer[req.req_pool_idx, :] = 0
+         self.req_device_buffer_size[req.req_pool_idx] = 0
+         self.req_to_host_pool[req.req_pool_idx, :] = -1
++        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
+         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
+         self._skip_first_backup[req.req_pool_idx] = False
+ 
+@@ -636,7 +645,7 @@ class HiSparseCoordinator:
+             item_size_bytes=self.mem_pool_host.token_stride_size,
+             num_top_k=self.top_k,
+             hot_buffer_size=self.device_buffer_size,
+-            page_size=1,
++            page_size=self.page_size,
+             block_size=block_size,
+             num_real_reqs=self.num_real_reqs,
+         )
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index 1a9708c414..dc6314ebfa 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -37,13 +37,14 @@ from sglang.srt.mem_cache.memory_pool import (
+     MLATokenToKVPool,
+     NSATokenToKVPool,
+ )
+-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
++from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+ 
+ _is_cuda = is_cuda()
++_is_hip = is_hip()
+ _is_npu = is_npu()
+ _is_xpu = is_xpu()
+ _is_mps = is_mps()
+-if not (_is_npu or _is_xpu or _is_mps):
++if _is_cuda or _is_hip:
+     from sgl_kernel.kvcacheio import (
+         transfer_kv_all_layer,
+         transfer_kv_all_layer_direct_lf_pf,
+@@ -88,6 +89,69 @@ class HostTensorAllocator(abc.ABC):
+         return tensor
+ 
+ 
++class HiSparseHostPoolMixin:
++    def _round_up_to_page_size(self, size: int) -> int:
++        return (size + self.page_size - 1) // self.page_size * self.page_size
++
++    def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
++        return self.alloc(num_pages * self.page_size)
++
++    def alloc_paged_token_slots(
++        self,
++        req_to_host_pool: torch.Tensor,
++        req_to_host_pool_allocated_len: torch.Tensor,
++        req_pool_idx: int,
++        start_pos: int,
++        num_tokens: int,
++    ) -> torch.Tensor:
++        """Allocate request host slots by page and return token-granular slots."""
++        device = req_to_host_pool.device
++        if num_tokens <= 0:
++            return torch.empty((0,), dtype=torch.int64, device=device)
++
++        allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
++        end_pos = start_pos + num_tokens
++        page_end = self._round_up_to_page_size(end_pos)
++        assert start_pos <= allocated_len
++
++        if page_end > allocated_len:
++            num_new_pages = (page_end - allocated_len) // self.page_size
++            host_locs = self.alloc_page(num_new_pages)
++            if host_locs is None:
++                logger.error(
++                    "HiSparse: host mem pool alloc failed for %d host pages "
++                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
++                    num_new_pages,
++                    req_pool_idx,
++                    start_pos,
++                    num_tokens,
++                )
++                raise RuntimeError(
++                    f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
++                )
++
++            req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
++                device=device, non_blocking=True
++            )
++            req_to_host_pool_allocated_len[req_pool_idx] = page_end
++
++        return req_to_host_pool[req_pool_idx, start_pos:end_pos]
++
++    def allocated_host_indices(
++        self,
++        req_to_host_pool: torch.Tensor,
++        req_pool_idx: int,
++        allocated_len: int,
++    ) -> torch.Tensor:
++        allocated_len = int(allocated_len)
++        host_len = min(
++            self._round_up_to_page_size(allocated_len),
++            req_to_host_pool.shape[1],
++        )
++        host_indices = req_to_host_pool[req_pool_idx, :host_len]
++        return host_indices[host_indices >= 0]
++
++
+ def get_allocator_from_storage(allocator_type):
+     if allocator_type == "mooncake":
+         try:
+@@ -783,7 +847,7 @@ class MHATokenToKVPoolHost(HostKVCache):
+         return ptr_list, element_size_list
+ 
+ 
+-class MLATokenToKVPoolHost(HostKVCache):
++class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
+     device_pool: MLATokenToKVPool
+ 
+     def __init__(
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 4229f40932..06af3a850c 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1442,15 +1442,21 @@ class ServerArgs:
+         user_set_prefill = self.nsa_prefill_backend is not None
+         user_set_decode = self.nsa_decode_backend is not None
+ 
+-        # HiSparse requires flashmla_sparse for both prefill and decode
++        # HiSparse: BF16 KV -> flashmla_sparse (native BF16 sparse).
++        # FP8 KV   -> flashmla_kv (native FP8 + sparse via is_fp8_kvcache=True + indices=...).
++        # flashmla_sparse does not accept FP8, and flashmla_kv does not accept BF16 sparse,
++        # so the KV dtype determines the backend when the user does not override.
+         if self.enable_hisparse:
++            hisparse_default_backend = (
++                "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
++            )
+             if not user_set_prefill:
+-                self.nsa_prefill_backend = "flashmla_sparse"
++                self.nsa_prefill_backend = hisparse_default_backend
+             if not user_set_decode:
+-                self.nsa_decode_backend = "flashmla_sparse"
++                self.nsa_decode_backend = hisparse_default_backend
+             logger.warning(
+-                f"HiSparse enabled: using flashmla_sparse NSA backends "
+-                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
++                f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
++                f"prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
+             )
+             return
+ 
+@@ -6170,16 +6176,30 @@ class ServerArgs:
+             assert (
+                 self.disable_radix_cache
+             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
++            if self.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
++                raise ValueError(
++                    f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
++                    f"but got --kv-cache-dtype={self.kv_cache_dtype}. "
++                    f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
++                )
++
++            # Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
++            # flashmla_kv only supports FP8 (it always reads KV as FP8 via
++            # is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
++            allowed_backends_for_dtype = {
++                "bfloat16": {"flashmla_sparse"},
++                "fp8_e4m3": {"flashmla_kv"},
++            }.get(self.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"})
+             for attr, label in [
+                 ("nsa_prefill_backend", "prefill"),
+                 ("nsa_decode_backend", "decode"),
+             ]:
+                 backend = getattr(self, attr)
+-                if backend is not None and backend != "flashmla_sparse":
++                if backend is not None and backend not in allowed_backends_for_dtype:
+                     raise ValueError(
+-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
+-                        f"but got --nsa-{label}-backend={backend}. "
+-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
++                        f"HiSparse with --kv-cache-dtype={self.kv_cache_dtype} requires "
++                        f"--nsa-{label}-backend in {sorted(allowed_backends_for_dtype)}, "
++                        f"but got {backend}."
+                     )
+ 
+         assert (

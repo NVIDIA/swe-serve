@@ -1,0 +1,2 @@
+test/registered/models/test_qwen35_public_serving.py::test_generate_known_answers_return_logprobs_at_declared_profile
+test/registered/models/test_qwen35_public_serving.py::test_batch_generate_preserves_independent_known_answers_at_declared_profile

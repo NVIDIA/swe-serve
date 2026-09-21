@@ -1,0 +1,2302 @@
+diff --git a/docs/advanced_features/speculative_decoding.md b/docs/advanced_features/speculative_decoding.md
+index 9806f244e..b8fe2d890 100644
+--- a/docs/advanced_features/speculative_decoding.md
++++ b/docs/advanced_features/speculative_decoding.md
+@@ -387,7 +387,7 @@ Enable it with:
+
+ | Parameter | Description | Default |
+ |---|---|---|
+-| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. | `12` |
++| `--speculative-num-draft-tokens` | Number of draft tokens verified per step. If omitted, defaults to `min(--speculative-ngram-max-trie-depth, 12)`. | `12` (with default ngram settings) |
+ | `--speculative-ngram-min-bfs-breadth` | Minimum BFS breadth. | `1` |
+ | `--speculative-ngram-max-bfs-breadth` | Maximum BFS breadth. | `10` |
+ | `--speculative-ngram-match-type` | Ngram tree-building mode: `"BFS"` for recency-based expansion or `"PROB"` for frequency-based expansion. | `"BFS"` |
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp
+index c79d7cd7d..5644b13e6 100644
+--- a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.cpp
+@@ -63,6 +63,68 @@ void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+   }
+ }
+
++// NOTE: staging operations (start/append/finish) are called from a background
++// thread during async corpus loading. They do NOT hold mutex_ because
++// staging_sam_ is disjoint from sams_ / trie_. Only finishExternalCorpusLoad
++// briefly acquires mutex_ when moving the completed SAM into sams_.
++void Ngram::startExternalCorpusLoad() {
++  if (staging_sam_) {
++    throw std::runtime_error("startExternalCorpusLoad called while another load is in progress");
++  }
++  staging_sam_ = std::make_unique<SuffixAutomaton>();
++}
++
++void Ngram::appendExternalCorpusTokens(const std::vector<int32_t>& tokens) {
++  if (!staging_sam_) {
++    throw std::runtime_error("appendExternalCorpusTokens called without startExternalCorpusLoad");
++  }
++  staging_sam_->appendTokens(tokens);
++}
++
++void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
++  if (!staging_sam_) {
++    throw std::runtime_error("finishExternalCorpusLoad called without startExternalCorpusLoad");
++  }
++  staging_sam_->finalize();
++  if (staging_sam_->empty()) {
++    staging_sam_.reset();
++    throw std::runtime_error("External corpus is empty — no tokens were loaded.");
++  }
++  // Only lock briefly to install the completed SAM.
++  std::unique_lock<std::mutex> lock(mutex_);
++  if (sams_.find(corpus_id) != sams_.end()) {
++    throw std::runtime_error(
++        "External corpus '" + corpus_id + "' already exists. Remove it before adding a new corpus with the same id.");
++  }
++  sams_.emplace(corpus_id, std::move(staging_sam_));
++}
++
++void Ngram::removeExternalCorpus(const std::string& corpus_id) {
++  std::unique_lock<std::mutex> lock(mutex_);
++  sams_.erase(corpus_id);
++}
++
++void Ngram::resetStagingSam() {
++  // staging_sam_ is only accessed from the loading thread — no lock needed.
++  staging_sam_.reset();
++}
++
++void Ngram::clearExternalCorpus() {
++  std::unique_lock<std::mutex> lock(mutex_);
++  sams_.clear();
++  staging_sam_.reset();
++}
++
++std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const {
++  std::unique_lock<std::mutex> lock(mutex_);
++  std::vector<std::pair<std::string, int64_t>> entries;
++  entries.reserve(sams_.size());
++  for (const auto& [id, sam] : sams_) {
++    entries.emplace_back(id, sam->tokenCount());
++  }
++  return entries;
++}
++
+ void Ngram::insertWorker() {
+   for (;;) {
+     std::vector<int32_t> data;
+@@ -116,16 +178,29 @@ Result Ngram::batchMatch(
+
+   std::unique_lock<std::mutex> lock(mutex_);
+
+-  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
+-  BuildFn build_fn;
++  using TrieResultBuildFn =
++      Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
++  using SamResultBuildFn = Result (SuffixAutomaton::*)(const int32_t*, size_t, int32_t, size_t, const Param&) const;
++  TrieResultBuildFn trie_result_build_fn;
++  SamResultBuildFn sam_result_build_fn;
+   if (param_.match_type == "BFS") {
+-    build_fn = &Trie::buildRecency;
++    trie_result_build_fn = &Trie::buildRecency;
++    sam_result_build_fn = &SuffixAutomaton::buildRecency;
+   } else if (param_.match_type == "PROB") {
+-    build_fn = &Trie::buildFrequency;
++    trie_result_build_fn = &Trie::buildFrequency;
++    sam_result_build_fn = &SuffixAutomaton::buildFrequency;
+   } else {
+     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
+   }
+
++  // All budget values are loop-invariant (mutex_ held, sams_ won't change).
++  const size_t num_sams = sams_.size();
++  const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
++  const size_t total_sam_budget =
++      num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
++  const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
++  const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
++
+   Result merged;
+   for (size_t i = 0; i < state_ids.size(); ++i) {
+     const auto& suffix = tokens[i];
+@@ -134,11 +209,26 @@ Result Ngram::batchMatch(
+     }
+
+     auto& state = match_state_[state_ids[i]];
+-    auto draft_token_num = param_.get_draft_token_num(tokens.size());
+-    auto res = (trie_.get()->*build_fn)(
+-        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, state, total_lens[i]);
+-    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
+-    merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
++
++    if (total_sam_budget == 0 || per_sam_budget == 0) {
++      auto res = (trie_.get()->*trie_result_build_fn)(
++          suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
++      merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
++      merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
++      continue;
++    }
++
++    auto combined = (trie_.get()->*trie_result_build_fn)(
++        suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
++
++    for (const auto& [_, sam] : sams_) {
++      auto sam_res =
++          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
++      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
++    }
++
++    merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());
++    merged.mask.insert(merged.mask.end(), combined.mask.begin(), combined.mask.end());
+   }
+   return merged;
+ }
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h
+index d1b404974..43c0b5915 100644
+--- a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram.h
+@@ -3,6 +3,7 @@
+ #include "param.h"
+ #include "queue.h"
+ #include "result.h"
++#include "suffix_automaton.h"
+ #include "trie.h"
+ #include <condition_variable>
+ #include <cstddef>
+@@ -18,11 +19,16 @@ namespace ngram {
+
+ class Ngram {
+   std::unique_ptr<Trie> trie_;
++  std::unordered_map<std::string, std::unique_ptr<SuffixAutomaton>> sams_;
++  // FIXME: single staging slot — only one corpus can be loaded at a time.
++  // To support concurrent loads, move staging into a per-load local variable.
++  std::unique_ptr<SuffixAutomaton> staging_sam_;
+   Param param_;
+
+-  // NOTE: protects trie_ and pending_count_. Ensures batchMatch never reads
+-  // trie_ while insertWorker is writing. After synchronize(), no pending
+-  // inserts remain so mutex_ contention is effectively zero.
++  // NOTE: protects trie_, sams_, and pending_count_. staging_sam_ is NOT
++  // protected by mutex_ — it is only accessed from the corpus loading thread.
++  // finishExternalCorpusLoad briefly acquires mutex_ to move the completed
++  // SAM into sams_.
+   mutable std::mutex mutex_;
+   mutable std::condition_variable sync_cv_;
+   // NOTE: tracks inserts from enqueue through trie_->insert() completion,
+@@ -40,6 +46,21 @@ class Ngram {
+
+   void asyncInsert(std::vector<std::vector<int32_t>>&& tokens);
+
++  void startExternalCorpusLoad();
++
++  void appendExternalCorpusTokens(const std::vector<int32_t>& tokens);
++
++  // Publishes the staged corpus. Duplicate corpus_id is rejected.
++  void finishExternalCorpusLoad(const std::string& corpus_id);
++
++  void removeExternalCorpus(const std::string& corpus_id);
++
++  void resetStagingSam();
++
++  void clearExternalCorpus();
++
++  std::vector<std::pair<std::string, int64_t>> listExternalCorpora() const;
++
+   Result batchMatch(const std::vector<std::vector<int32_t>>& tokens);
+
+   Result batchMatch(
+@@ -49,6 +70,9 @@ class Ngram {
+
+   void eraseMatchState(const std::vector<int64_t>& state_ids);
+
++  // Resets the online trie and match state but preserves external corpora
++  // (sams_). External corpora are user-managed via add/remove APIs and
++  // should not be affected by cache flushes.
+   void reset() {
+     std::unique_lock<std::mutex> lock(mutex_);
+     if (trie_) {
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp
+index bbd815c51..be059e419 100644
+--- a/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/ngram_corpus_ffi.cpp
+@@ -23,7 +23,9 @@ struct NgramCorpusObj : public tvm::ffi::Object {
+       int64_t min_bfs_breadth,
+       int64_t max_bfs_breadth,
+       int64_t draft_token_num,
+-      int64_t match_type) {
++      int64_t match_type,
++      int64_t external_sam_budget,
++      int64_t external_corpus_max_tokens) {
+     ngram::Param param;
+     param.enable = true;
+     param.enable_router_mode = false;
+@@ -32,6 +34,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
+     param.max_bfs_breadth = static_cast<size_t>(max_bfs_breadth);
+     param.draft_token_num = static_cast<size_t>(draft_token_num);
+     param.match_type = (match_type == 0) ? "BFS" : "PROB";
++    param.external_sam_budget = static_cast<size_t>(external_sam_budget);
++    param.external_corpus_max_tokens = static_cast<size_t>(external_corpus_max_tokens);
+     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
+   }
+
+@@ -97,6 +101,43 @@ struct NgramCorpusObj : public tvm::ffi::Object {
+     ngram_->eraseMatchState(state_ids);
+   }
+
++  void start_external_corpus_load() {
++    ngram_->startExternalCorpusLoad();
++  }
++
++  void append_external_corpus_tokens(const tvm::ffi::TensorView tokens_tv) {
++    auto* data = static_cast<const int32_t*>(tokens_tv.data_ptr());
++    int64_t n = tokens_tv.size(0);
++    std::vector<int32_t> tokens(data, data + n);
++    ngram_->appendExternalCorpusTokens(tokens);
++  }
++
++  void finish_external_corpus_load(const std::string& corpus_id) {
++    ngram_->finishExternalCorpusLoad(corpus_id);
++  }
++
++  void remove_external_corpus(const std::string& corpus_id) {
++    ngram_->removeExternalCorpus(corpus_id);
++  }
++
++  void cancel_external_corpus_load() {
++    ngram_->resetStagingSam();
++  }
++
++  void clear_external_corpus() {
++    ngram_->clearExternalCorpus();
++  }
++
++  std::string list_external_corpora() {
++    auto entries = ngram_->listExternalCorpora();
++    std::string result;
++    for (size_t i = 0; i < entries.size(); ++i) {
++      if (i > 0) result += "\n";
++      result += entries[i].first + "\t" + std::to_string(entries[i].second);
++    }
++    return result;
++  }
++
+   void synchronize() {
+     ngram_->synchronize();
+   }
+@@ -130,11 +171,18 @@ struct NgramCorpusObj : public tvm::ffi::Object {
+ void register_ngram_corpus() {
+   namespace refl = tvm::ffi::reflection;
+   refl::ObjectDef<NgramCorpusObj>()
+-      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
++      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
+       .def("async_insert", &NgramCorpusObj::async_insert)
+       .def("batch_match", &NgramCorpusObj::batch_match)
+       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
+       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
++      .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
++      .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
++      .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)
++      .def("remove_external_corpus", &NgramCorpusObj::remove_external_corpus)
++      .def("cancel_external_corpus_load", &NgramCorpusObj::cancel_external_corpus_load)
++      .def("clear_external_corpus", &NgramCorpusObj::clear_external_corpus)
++      .def("list_external_corpora", &NgramCorpusObj::list_external_corpora)
+       .def("synchronize", &NgramCorpusObj::synchronize)
+       .def("reset", &NgramCorpusObj::reset);
+ }
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/param.h b/python/sglang/jit_kernel/csrc/ngram_corpus/param.h
+index 725f635db..9c2701b1b 100644
+--- a/python/sglang/jit_kernel/csrc/ngram_corpus/param.h
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/param.h
+@@ -19,6 +19,8 @@ struct Param {
+   size_t max_bfs_breadth;
+   size_t max_trie_depth;
+   size_t draft_token_num;
++  size_t external_sam_budget = 0;
++  size_t external_corpus_max_tokens = 10000000;
+   std::string match_type;
+
+   std::vector<size_t> batch_draft_token_num;
+@@ -92,7 +94,8 @@ struct Param {
+     ss << "enable = " << enable << ", enable_router_mode = " << enable_router_mode
+        << ", min_bfs_breadth = " << min_bfs_breadth << ", max_bfs_breadth = " << max_bfs_breadth
+        << ", max_trie_depth = " << max_trie_depth << ", draft_token_num = " << draft_token_num
+-       << ", match_type = " << match_type;
++       << ", external_sam_budget = " << external_sam_budget
++       << ", external_corpus_max_tokens = " << external_corpus_max_tokens << ", match_type = " << match_type;
+     ss << ", batch_draft_token_num(" << batch_draft_token_num.size() << ") = ";
+     for (int i = 0; i < batch_draft_token_num.size(); ++i) {
+       ss << i << "|" << batch_draft_token_num[i] << ",";
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp
+index 404b7a3f2..07138bf8d 100644
+--- a/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/result.cpp
+@@ -1,5 +1,6 @@
+ #include "result.h"
+
++#include <algorithm>
+ #include <cstring>
+ #include <queue>
+ #include <tuple>
+@@ -47,6 +48,81 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree,
+   return info;
+ }
+
++std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
++  const auto n = static_cast<int>(result.token.size());
++  if (n <= 1) {
++    return {};
++  }
++
++  std::vector<int> parent(n, -1);
++  std::vector<bool> has_child(n, false);
++  for (int i = 1; i < n; ++i) {
++    for (int j = i - 1; j >= 0; --j) {
++      if (result.mask[i * n + j]) {
++        parent[i] = j;
++        has_child[j] = true;
++        break;
++      }
++    }
++  }
++
++  std::vector<std::vector<int32_t>> paths;
++  for (int leaf = 1; leaf < n; ++leaf) {
++    if (has_child[leaf]) {
++      continue;
++    }
++    std::vector<int32_t> path;
++    for (int cursor = leaf; cursor > 0; cursor = parent[cursor]) {
++      path.emplace_back(result.token[cursor]);
++    }
++    std::reverse(path.begin(), path.end());
++    if (path.size() == 1 && path.front() == 0) {
++      continue;
++    }
++    paths.emplace_back(std::move(path));
++  }
++  return paths;
++}
++
++Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std::vector<std::vector<int32_t>>& paths) {
++  std::vector<Node> tree(draft_token_num);
++  const int root = 0;
++  int cursor = 1;
++  for (const auto& path : paths) {
++    int parent = root;
++    for (const auto token : path) {
++      auto iter = tree[parent].next.find(token);
++      if (iter == tree[parent].next.end()) {
++        if (cursor >= draft_token_num) {
++          parent = -1;
++          break;
++        }
++        iter = tree[parent].next.insert({token, cursor++}).first;
++      }
++      parent = iter->second;
++    }
++    if (cursor >= draft_token_num) {
++      break;
++    }
++  }
++  return fillResult(last_token, draft_token_num, tree, root);
++}
++
++Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary) {
++  auto primary_paths = extractLeafPaths_(primary);
++  auto secondary_paths = extractLeafPaths_(secondary);
++  std::vector<std::vector<int32_t>> merged_paths = std::move(primary_paths);
++  merged_paths.reserve(merged_paths.size() + secondary_paths.size());
++  for (const auto& path : secondary_paths) {
++    if (path.empty()) {
++      continue;
++    }
++    merged_paths.emplace_back(path);
++  }
++
++  return buildResultFromLeafPaths_(last_token, draft_token_num, merged_paths);
++}
++
+ void Result::truncate(size_t n) {
+   if (n < token.size()) {
+     int full_n = token.size();
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/result.h b/python/sglang/jit_kernel/csrc/ngram_corpus/result.h
+index c48351d77..3e7cc6a82 100644
+--- a/python/sglang/jit_kernel/csrc/ngram_corpus/result.h
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/result.h
+@@ -18,5 +18,8 @@ struct Node {
+ };
+
+ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root);
++std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result);
++Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std::vector<std::vector<int32_t>>& paths);
++Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary);
+
+ }  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/suffix_automaton.cpp b/python/sglang/jit_kernel/csrc/ngram_corpus/suffix_automaton.cpp
+new file mode 100644
+index 000000000..65d8a7d1b
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/suffix_automaton.cpp
+@@ -0,0 +1,283 @@
++#include "suffix_automaton.h"
++
++#include <algorithm>
++#include <numeric>
++#include <queue>
++#include <stdexcept>
++#include <string>
++#include <tuple>
++
++namespace ngram {
++
++SuffixAutomaton::SuffixAutomaton() {
++  reset_();
++}
++
++void SuffixAutomaton::reset_() {
++  states_.clear();
++  states_.emplace_back();
++  last_ = 0;
++  pos_ = 0;
++  saw_token_ = false;
++  finalized_ = false;
++  loaded_ = false;
++}
++
++void SuffixAutomaton::appendTokens(const std::vector<int32_t>& tokens) {
++  if (finalized_) {
++    throw std::runtime_error("Cannot append tokens after finalizing the SAM.");
++  }
++  if (tokens.empty()) {
++    return;
++  }
++
++  for (const auto token : tokens) {
++    extend_(token, pos_++);
++    saw_token_ = true;
++  }
++}
++
++void SuffixAutomaton::finalize() {
++  if (finalized_) {
++    return;
++  }
++  finalized_ = true;
++  if (!saw_token_) {
++    return;
++  }
++
++  propagateOccurrencesAndRecency_();
++  loaded_ = true;
++}
++
++void SuffixAutomaton::extend_(int32_t token, int64_t pos) {
++  const int cur = static_cast<int>(states_.size());
++  states_.emplace_back();
++  states_[cur].max_len = states_[last_].max_len + 1;
++  states_[cur].occ_count = 1;
++  states_[cur].max_end_pos = pos;
++
++  int p = last_;
++  while (p != -1 && !states_[p].next.contains(token)) {
++    states_[p].next[token] = cur;
++    p = states_[p].link;
++  }
++
++  if (p == -1) {
++    states_[cur].link = 0;
++    last_ = cur;
++    return;
++  }
++
++  const int q = states_[p].next[token];
++  if (states_[p].max_len + 1 == states_[q].max_len) {
++    states_[cur].link = q;
++    last_ = cur;
++    return;
++  }
++
++  const int clone = static_cast<int>(states_.size());
++  states_.push_back(states_[q]);
++  states_[clone].max_len = states_[p].max_len + 1;
++  states_[clone].occ_count = 0;
++  states_[clone].children_by_freq.clear();
++  states_[clone].children_by_recency.clear();
++
++  while (p != -1 && states_[p].next[token] == q) {
++    states_[p].next[token] = clone;
++    p = states_[p].link;
++  }
++
++  states_[q].link = clone;
++  states_[cur].link = clone;
++  last_ = cur;
++}
++
++void SuffixAutomaton::propagateOccurrencesAndRecency_() {
++  std::vector<int> order(states_.size());
++  std::iota(order.begin(), order.end(), 0);
++  std::sort(
++      order.begin(), order.end(), [this](int lhs, int rhs) { return states_[lhs].max_len < states_[rhs].max_len; });
++
++  for (auto it = order.rbegin(); it != order.rend(); ++it) {
++    const int state = *it;
++    const int link = states_[state].link;
++    if (link < 0) {
++      continue;
++    }
++    states_[link].occ_count += states_[state].occ_count;
++    states_[link].max_end_pos = std::max(states_[link].max_end_pos, states_[state].max_end_pos);
++  }
++
++  for (auto& state : states_) {
++    state.children_by_freq.clear();
++    state.children_by_recency.clear();
++    state.children_by_freq.reserve(state.next.size());
++    state.children_by_recency.reserve(state.next.size());
++    for (const auto& [token, child_state] : state.next) {
++      if (token == kSeparatorToken) {
++        continue;
++      }
++      state.children_by_freq.emplace_back(token, child_state);
++      state.children_by_recency.emplace_back(token, child_state);
++    }
++
++    std::sort(state.children_by_freq.begin(), state.children_by_freq.end(), [this](const auto& lhs, const auto& rhs) {
++      const auto lhs_freq = states_[lhs.second].occ_count;
++      const auto rhs_freq = states_[rhs.second].occ_count;
++      return std::tie(rhs_freq, lhs.first, lhs.second) < std::tie(lhs_freq, rhs.first, rhs.second);
++    });
++    std::sort(
++        state.children_by_recency.begin(), state.children_by_recency.end(), [this](const auto& lhs, const auto& rhs) {
++          const auto lhs_recency = states_[lhs.second].max_end_pos;
++          const auto rhs_recency = states_[rhs.second].max_end_pos;
++          return std::tie(rhs_recency, lhs.first, lhs.second) < std::tie(lhs_recency, rhs.first, rhs.second);
++        });
++  }
++}
++
++std::vector<SamAnchor> SuffixAutomaton::match(const int32_t* context, size_t len, size_t max_depth) const {
++  if (empty() || len == 0) {
++    return {};
++  }
++
++  const auto start = len > max_depth ? len - max_depth : 0;
++  int state = 0;
++  int32_t matched_len = 0;
++  for (size_t i = start; i < len; ++i) {
++    const auto token = context[i];
++    while (state != 0 && !states_[state].next.contains(token)) {
++      state = states_[state].link;
++      matched_len = std::min<int32_t>(matched_len, states_[state].max_len);
++    }
++    if (auto iter = states_[state].next.find(token); iter != states_[state].next.end()) {
++      state = iter->second;
++      ++matched_len;
++    } else if (auto root_iter = states_[0].next.find(token); root_iter != states_[0].next.end()) {
++      state = root_iter->second;
++      matched_len = 1;
++    } else {
++      state = 0;
++      matched_len = 0;
++    }
++  }
++
++  std::vector<SamAnchor> anchors;
++  while (state > 0 && matched_len > 0) {
++    if (!states_[state].children_by_freq.empty()) {
++      anchors.push_back({state, matched_len});
++    }
++    state = states_[state].link;
++    if (state <= 0) {
++      break;
++    }
++    matched_len = std::min<int32_t>(matched_len, states_[state].max_len);
++  }
++  return anchors;
++}
++
++Result SuffixAutomaton::buildRecency(
++    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
++  auto anchors = match(context, len, param.max_trie_depth);
++  const auto max_match_depth = std::max<int32_t>(1, static_cast<int32_t>(param.max_trie_depth - 1));
++  const double bfs_breadth_scale = double(param.max_bfs_breadth - param.min_bfs_breadth) / max_match_depth;
++  std::vector<Node> tree(draft_token_num + 1);
++  int root = 0;
++  int cursor = 1;
++
++  for (const auto& anchor : anchors) {
++    std::queue<std::tuple<int, double, int>> queue;
++    queue.push(
++        {root, (max_match_depth - anchor.matched_len) * bfs_breadth_scale + param.min_bfs_breadth, anchor.state});
++    while (!queue.empty() && cursor <= static_cast<int>(draft_token_num)) {
++      auto [parent, cur_breadth, state] = queue.front();
++      queue.pop();
++
++      const auto& children = states_[state].children_by_recency;
++      const auto breadth = std::max(1, static_cast<int32_t>(cur_breadth));
++      for (int i = 0;
++           i < breadth && i < static_cast<int>(children.size()) && cursor <= static_cast<int>(draft_token_num);
++           ++i) {
++        const auto [token, child_state] = children[i];
++        int pos = -1;
++        if (auto iter = tree[parent].next.find(token); iter != tree[parent].next.end()) {
++          pos = iter->second;
++        } else {
++          pos = tree[parent].next.insert({token, cursor++}).first->second;
++        }
++        queue.emplace(pos, cur_breadth - bfs_breadth_scale, child_state);
++      }
++    }
++  }
++  return fillResult(last_token, draft_token_num + 1, tree, root);
++}
++
++Result SuffixAutomaton::buildFrequency(
++    const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const {
++  auto anchors = match(context, len, param.max_trie_depth);
++  struct CompareByProb {
++    bool operator()(
++        const std::tuple<int, int32_t, int, double>& lhs, const std::tuple<int, int32_t, int, double>& rhs) const {
++      return std::get<3>(lhs) < std::get<3>(rhs);
++    }
++  };
++
++  std::priority_queue<
++      std::tuple<int, int32_t, int, double>,
++      std::vector<std::tuple<int, int32_t, int, double>>,
++      CompareByProb>
++      heap;
++  std::vector<Node> tree(draft_token_num + 1);
++  int root = 0;
++  int cursor = 1;
++  const int top_k = static_cast<int>(param.max_bfs_breadth);
++
++  auto addToHeap = [this, &heap, top_k](int parent, int state, double prob) {
++    if (top_k <= 0) {
++      return;
++    }
++    const auto& children = states_[state].children_by_freq;
++    if (children.empty()) {
++      return;
++    }
++    double sum_freq = 0.0;
++    int count = 0;
++    for (const auto& [_, child_state] : children) {
++      sum_freq += static_cast<double>(states_[child_state].occ_count);
++      if (++count >= top_k) {
++        break;
++      }
++    }
++    if (sum_freq <= 0) {
++      sum_freq = 1.0;
++    }
++    count = 0;
++    for (const auto& [token, child_state] : children) {
++      const auto scaled_prob = static_cast<double>(states_[child_state].occ_count) / sum_freq * prob;
++      heap.emplace(parent, token, child_state, scaled_prob);
++      if (++count >= top_k) {
++        break;
++      }
++    }
++  };
++
++  for (const auto& anchor : anchors) {
++    addToHeap(root, anchor.state, 1.0);
++    while (!heap.empty() && cursor <= static_cast<int>(draft_token_num)) {
++      auto [parent, token, child_state, prob] = heap.top();
++      heap.pop();
++
++      int pos = -1;
++      if (auto iter = tree[parent].next.find(token); iter != tree[parent].next.end()) {
++        pos = iter->second;
++      } else {
++        pos = cursor++;
++        tree[parent].next[token] = pos;
++      }
++      addToHeap(pos, child_state, prob);
++    }
++  }
++  return fillResult(last_token, draft_token_num + 1, tree, root);
++}
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/csrc/ngram_corpus/suffix_automaton.h b/python/sglang/jit_kernel/csrc/ngram_corpus/suffix_automaton.h
+new file mode 100644
+index 000000000..6cecfe5d5
+--- /dev/null
++++ b/python/sglang/jit_kernel/csrc/ngram_corpus/suffix_automaton.h
+@@ -0,0 +1,66 @@
++#pragma once
++
++#include "param.h"
++#include "result.h"
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <unordered_map>
++#include <vector>
++
++namespace ngram {
++
++struct SamAnchor {
++  int state = 0;
++  int32_t matched_len = 0;
++};
++
++struct SamState {
++  int link = -1;
++  int32_t max_len = 0;
++  std::unordered_map<int32_t, int> next;
++  uint64_t occ_count = 0;
++  int64_t max_end_pos = -1;
++  std::vector<std::pair<int32_t, int>> children_by_freq;
++  std::vector<std::pair<int32_t, int>> children_by_recency;
++};
++
++class SuffixAutomaton {
++ public:
++  static constexpr int32_t kSeparatorToken = std::numeric_limits<int32_t>::min();
++
++  SuffixAutomaton();
++
++  void appendTokens(const std::vector<int32_t>& tokens);
++
++  void finalize();
++
++  bool empty() const {
++    return !loaded_;
++  }
++
++  int64_t tokenCount() const {
++    return pos_;
++  }
++
++  Result buildRecency(
++      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
++
++  Result buildFrequency(
++      const int32_t* context, size_t len, int32_t last_token, size_t draft_token_num, const Param& param) const;
++
++ private:
++  void reset_();
++  void extend_(int32_t token, int64_t pos);
++  void propagateOccurrencesAndRecency_();
++  std::vector<SamAnchor> match(const int32_t* context, size_t len, size_t max_depth) const;
++
++  std::vector<SamState> states_;
++  int last_ = 0;
++  int64_t pos_ = 0;
++  bool saw_token_ = false;
++  bool finalized_ = false;
++  bool loaded_ = false;
++};
++
++}  // namespace ngram
+diff --git a/python/sglang/jit_kernel/ngram_corpus.py b/python/sglang/jit_kernel/ngram_corpus.py
+index 2182c5c34..da0d56a89 100644
+--- a/python/sglang/jit_kernel/ngram_corpus.py
++++ b/python/sglang/jit_kernel/ngram_corpus.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+
+-from typing import List, Tuple
++from collections.abc import Iterable, Sequence
++from typing import Dict, List, Tuple
+
+ import numpy as np
+ import torch
+@@ -29,6 +30,7 @@ def get_ngram_corpus_cls():
+         cpp_files=[
+             "ngram_corpus/result.cpp",
+             "ngram_corpus/trie.cpp",
++            "ngram_corpus/suffix_automaton.cpp",
+             "ngram_corpus/ngram.cpp",
+             "ngram_corpus/ngram_corpus_ffi.cpp",
+         ],
+@@ -48,6 +50,8 @@ def get_ngram_corpus_cls():
+             max_bfs_breadth: int,
+             draft_token_num: int,
+             match_type: str,
++            external_sam_budget: int = 0,
++            external_corpus_max_tokens: int = 10000000,
+         ) -> None:
+             mt = _MATCH_TYPE_MAP.get(match_type)
+             if mt is None:
+@@ -61,6 +65,8 @@ def get_ngram_corpus_cls():
+                 max_bfs_breadth,
+                 draft_token_num,
+                 mt,
++                external_sam_budget,
++                external_corpus_max_tokens,
+             )
+             self._draft_token_num = draft_token_num
+
+@@ -112,4 +118,40 @@ def get_ngram_corpus_cls():
+             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
+             self.erase_match_state(state_ids_t)  # type: ignore
+
++        def load_external_corpus_named(
++            self, corpus_id: str, chunks: Iterable[Sequence[int]], max_tokens: int
++        ) -> Tuple[int, int]:
++            self.start_external_corpus_load()  # type: ignore
++            chunk_count = 0
++            loaded_token_count = 0
++            try:
++                for chunk in chunks:
++                    tokens_t = torch.tensor(list(chunk), dtype=torch.int32)
++                    if loaded_token_count + len(tokens_t) > max_tokens:
++                        raise ValueError(
++                            "External ngram corpus exceeds the remaining token budget "
++                            f"({max_tokens}) after loading {loaded_token_count} tokens."
++                        )
++                    loaded_token_count += len(tokens_t)
++                    self.append_external_corpus_tokens(tokens_t)  # type: ignore
++                    chunk_count += 1
++                self.finish_external_corpus_load(corpus_id)  # type: ignore
++            except Exception:
++                self.cancel_external_corpus_load()  # type: ignore
++                raise
++            return chunk_count, loaded_token_count
++
++        def remove_corpus(self, corpus_id: str) -> None:
++            self.remove_external_corpus(corpus_id)  # type: ignore
++
++        def list_corpora(self) -> Dict[str, int]:
++            result = self.list_external_corpora()  # type: ignore
++            if not result:
++                return {}
++            out: Dict[str, int] = {}
++            for line in result.split("\n"):
++                corpus_id, token_count = line.split("\t", 1)
++                out[corpus_id] = int(token_count)
++            return out
++
+     return NgramCorpusFFI
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 6978e0c06..ff9f439a2 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -733,6 +733,64 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
+     )
+
+
++@app.post("/add_external_corpus")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def add_external_corpus(request: Request):
++    """Add an external corpus for ngram speculative decoding."""
++    from sglang.srt.managers.io_struct import AddExternalCorpusReqInput
++
++    try:
++        obj = AddExternalCorpusReqInput(**(await request.json()))
++    except TypeError as e:
++        return ORJSONResponse(
++            {"success": False, "message": str(e)},
++            status_code=HTTPStatus.BAD_REQUEST,
++        )
++    result = await _global_state.tokenizer_manager.add_external_corpus(obj)
++    return ORJSONResponse(
++        {
++            "success": result.success,
++            "corpus_id": result.corpus_id,
++            "message": result.message,
++            "loaded_token_count": result.loaded_token_count,
++        },
++        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
++    )
++
++
++@app.post("/remove_external_corpus")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def remove_external_corpus(request: Request):
++    """Remove an external corpus by ID."""
++    body = await request.json()
++    corpus_id = body.get("corpus_id")
++    if not corpus_id:
++        return ORJSONResponse(
++            {"success": False, "message": "corpus_id is required."},
++            status_code=HTTPStatus.BAD_REQUEST,
++        )
++    result = await _global_state.tokenizer_manager.remove_external_corpus(corpus_id)
++    return ORJSONResponse(
++        {"success": result.success, "message": result.message},
++        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
++    )
++
++
++@app.get("/list_external_corpora")
++@auth_level(AuthLevel.ADMIN_OPTIONAL)
++async def list_external_corpora():
++    """List all active external corpora."""
++    result = await _global_state.tokenizer_manager.list_external_corpora()
++    return ORJSONResponse(
++        {
++            "success": result.success,
++            "corpus_token_counts": result.corpus_token_counts,
++            "message": result.message,
++        },
++        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
++    )
++
++
+ @app.api_route("/clear_hicache_storage_backend", methods=["GET", "POST"])
+ @auth_level(AuthLevel.ADMIN_OPTIONAL)
+ async def clear_hicache_storage_backend_deprecated():
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index bd9796534..e7e34d230 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -1131,6 +1131,45 @@ class FlushCacheReqOutput(BaseReq):
+     message: str = ""
+
+
++@dataclass
++class AddExternalCorpusReqInput(BaseReq):
++    corpus_id: Optional[str] = None
++    file_path: Optional[str] = None
++    documents: Optional[List[str]] = None
++    token_chunks: Optional[List[List[int]]] = None
++
++
++@dataclass
++class AddExternalCorpusReqOutput(BaseReq):
++    success: bool
++    corpus_id: str = ""
++    message: str = ""
++    loaded_token_count: int = 0
++
++
++@dataclass
++class RemoveExternalCorpusReqInput(BaseReq):
++    corpus_id: str
++
++
++@dataclass
++class RemoveExternalCorpusReqOutput(BaseReq):
++    success: bool
++    message: str = ""
++
++
++@dataclass
++class ListExternalCorporaReqInput(BaseReq):
++    pass
++
++
++@dataclass
++class ListExternalCorporaReqOutput(BaseReq):
++    success: bool
++    corpus_token_counts: Dict[str, int] = field(default_factory=dict)
++    message: str = ""
++
++
+ @dataclass
+ class AttachHiCacheStorageReqInput(BaseReq):
+     """Dynamically attach (enable) HiCache storage backend at runtime.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index cfcae1af6..7ab28f5a6 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -83,6 +83,8 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+ from sglang.srt.managers.io_struct import (
+     AbortReq,
+     ActiveRanksOutput,
++    AddExternalCorpusReqInput,
++    AddExternalCorpusReqOutput,
+     AttachHiCacheStorageReqInput,
+     AttachHiCacheStorageReqOutput,
+     BaseBatchReq,
+@@ -114,6 +116,8 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsSendGroupForRemoteInstanceReqInput,
+     InitWeightsSendGroupForRemoteInstanceReqOutput,
+     InitWeightsUpdateGroupReqInput,
++    ListExternalCorporaReqInput,
++    ListExternalCorporaReqOutput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterFromTensorsReqOutput,
+     LoadLoRAAdapterReqInput,
+@@ -122,6 +126,8 @@ from sglang.srt.managers.io_struct import (
+     PauseGenerationReqInput,
+     ProfileReq,
+     ReleaseMemoryOccupationReqInput,
++    RemoveExternalCorpusReqInput,
++    RemoveExternalCorpusReqOutput,
+     ResumeMemoryOccupationReqInput,
+     RpcReqInput,
+     RpcReqOutput,
+@@ -599,6 +605,7 @@ class Scheduler(
+     def maybe_init_draft_worker(self):
+         if self.spec_algorithm.is_none():
+             self.draft_worker = None
++            self.external_corpus_manager = None
+             return
+
+         # Launch a draft worker for speculative decoding
+@@ -625,6 +632,18 @@ class Scheduler(
+         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
+         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
+
++        if self.spec_algorithm.is_ngram():
++            from sglang.srt.speculative.external_corpus_manager import (
++                ExternalCorpusManager,
++            )
++
++            self.external_corpus_manager = ExternalCorpusManager(
++                self.draft_worker,
++                self.send_to_tokenizer.send_output,
++            )
++        else:
++            self.external_corpus_manager = None
++
+     def init_model_worker(self):
+         self.init_tp_model_worker()
+         self.maybe_init_draft_worker()
+@@ -1251,6 +1270,15 @@ class Scheduler(
+                 (PauseGenerationReqInput, self.pause_generation),
+                 (ContinueGenerationReqInput, self.continue_generation),
+                 (DumperControlReqInput, self.handle_dumper_control),
++                (AddExternalCorpusReqInput, self.add_external_corpus),
++                (
++                    RemoveExternalCorpusReqInput,
++                    self.remove_external_corpus,
++                ),
++                (
++                    ListExternalCorporaReqInput,
++                    self.list_external_corpora,
++                ),
+             ]
+         )
+
+@@ -1605,6 +1633,8 @@ class Scheduler(
+                         self.recv_from_rpc.send_pyobj(output)
+
+         self._check_pending_flush()
++        if self.external_corpus_manager is not None:
++            self.external_corpus_manager.check_pending_load()
+
+     def init_req_max_new_tokens(self, req):
+         req.sampling_params.max_new_tokens = min(
+@@ -2865,6 +2895,36 @@ class Scheduler(
+                 pending_req,
+             )
+
++    def add_external_corpus(
++        self, recv_req: AddExternalCorpusReqInput
++    ) -> Optional[AddExternalCorpusReqOutput]:
++        if self.external_corpus_manager is None:
++            return AddExternalCorpusReqOutput(
++                success=False,
++                message="Ngram speculative decoding is not enabled.",
++            )
++        return self.external_corpus_manager.add(recv_req)
++
++    def remove_external_corpus(
++        self, recv_req: RemoveExternalCorpusReqInput
++    ) -> RemoveExternalCorpusReqOutput:
++        if self.external_corpus_manager is None:
++            return RemoveExternalCorpusReqOutput(
++                success=False,
++                message="Ngram speculative decoding is not enabled.",
++            )
++        return self.external_corpus_manager.remove(recv_req)
++
++    def list_external_corpora(
++        self, recv_req: ListExternalCorporaReqInput
++    ) -> ListExternalCorporaReqOutput:
++        if self.external_corpus_manager is None:
++            return ListExternalCorporaReqOutput(
++                success=False,
++                message="Ngram speculative decoding is not enabled.",
++            )
++        return self.external_corpus_manager.list(recv_req)
++
+     def flush_cache_wrapped(
+         self, recv_req: FlushCacheReqInput
+     ) -> Optional[FlushCacheReqOutput]:
+diff --git a/python/sglang/srt/managers/tokenizer_communicator_mixin.py b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+index 544c60940..b78427db3 100644
+--- a/python/sglang/srt/managers/tokenizer_communicator_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_communicator_mixin.py
+@@ -23,6 +23,8 @@ import fastapi
+ import zmq
+
+ from sglang.srt.managers.io_struct import (
++    AddExternalCorpusReqInput,
++    AddExternalCorpusReqOutput,
+     AttachHiCacheStorageReqInput,
+     AttachHiCacheStorageReqOutput,
+     CheckWeightsReqInput,
+@@ -53,6 +55,8 @@ from sglang.srt.managers.io_struct import (
+     InitWeightsSendGroupForRemoteInstanceReqOutput,
+     InitWeightsUpdateGroupReqInput,
+     InitWeightsUpdateGroupReqOutput,
++    ListExternalCorporaReqInput,
++    ListExternalCorporaReqOutput,
+     LoadLoRAAdapterFromTensorsReqInput,
+     LoadLoRAAdapterFromTensorsReqOutput,
+     LoadLoRAAdapterReqInput,
+@@ -64,6 +68,8 @@ from sglang.srt.managers.io_struct import (
+     ProfileReqType,
+     ReleaseMemoryOccupationReqInput,
+     ReleaseMemoryOccupationReqOutput,
++    RemoveExternalCorpusReqInput,
++    RemoveExternalCorpusReqOutput,
+     ResumeMemoryOccupationReqInput,
+     ResumeMemoryOccupationReqOutput,
+     SendWeightsToRemoteInstanceReqInput,
+@@ -205,6 +211,15 @@ class TokenizerCommunicatorMixin:
+         self.flush_cache_communicator = _Communicator(
+             self.send_to_scheduler, server_args.dp_size
+         )
++        self.add_external_corpus_communicator = _Communicator(
++            self.send_to_scheduler, server_args.dp_size
++        )
++        self.remove_external_corpus_communicator = _Communicator(
++            self.send_to_scheduler, server_args.dp_size
++        )
++        self.list_external_corpora_communicator = _Communicator(
++            self.send_to_scheduler, server_args.dp_size
++        )
+         self.clear_hicache_storage_communicator = _Communicator(
+             self.send_to_scheduler, server_args.dp_size
+         )
+@@ -308,6 +323,18 @@ class TokenizerCommunicatorMixin:
+                     FlushCacheReqOutput,
+                     self.flush_cache_communicator.handle_recv,
+                 ),
++                (
++                    AddExternalCorpusReqOutput,
++                    self.add_external_corpus_communicator.handle_recv,
++                ),
++                (
++                    RemoveExternalCorpusReqOutput,
++                    self.remove_external_corpus_communicator.handle_recv,
++                ),
++                (
++                    ListExternalCorporaReqOutput,
++                    self.list_external_corpora_communicator.handle_recv,
++                ),
+                 (
+                     ProfileReqOutput,
+                     self.profile_communicator.handle_recv,
+@@ -343,6 +370,118 @@ class TokenizerCommunicatorMixin:
+             ]
+         )
+
++    async def add_external_corpus(
++        self: TokenizerManager, obj: AddExternalCorpusReqInput
++    ) -> AddExternalCorpusReqOutput:
++        self.auto_create_handle_loop()
++        if self.server_args.speculative_algorithm != "NGRAM":
++            return AddExternalCorpusReqOutput(
++                success=False,
++                message="Ngram speculative decoding is not enabled.",
++            )
++        truncated = False
++        try:
++            if not obj.corpus_id:
++                import uuid
++
++                obj.corpus_id = uuid.uuid4().hex
++            if obj.file_path is not None:
++                from sglang.srt.speculative.cpp_ngram.external_corpus import (
++                    iter_external_corpus_chunks,
++                )
++
++                max_tokens = (
++                    self.server_args.speculative_ngram_external_corpus_max_tokens
++                )
++                obj.token_chunks = list(
++                    iter_external_corpus_chunks(
++                        obj.file_path, self.tokenizer, max_tokens
++                    )
++                )
++            elif obj.documents is not None:
++                from sglang.srt.speculative.cpp_ngram.external_corpus import (
++                    SEPARATOR_TOKEN,
++                )
++
++                max_tokens = (
++                    self.server_args.speculative_ngram_external_corpus_max_tokens
++                )
++                token_chunks = []
++                total_tokens = 0
++                has_prev = False
++                for doc in obj.documents:
++                    if not doc:
++                        continue
++                    token_ids = list(
++                        self.tokenizer.encode(doc, add_special_tokens=False)
++                    )
++                    if not token_ids:
++                        continue
++                    if has_prev:
++                        token_ids = [SEPARATOR_TOKEN] + token_ids
++                    if total_tokens + len(token_ids) > max_tokens:
++                        truncated = True
++                        break
++                    token_chunks.append(token_ids)
++                    total_tokens += len(token_ids)
++                    has_prev = True
++                obj.token_chunks = token_chunks
++            else:
++                return AddExternalCorpusReqOutput(
++                    success=False,
++                    message="Either file_path or documents must be provided.",
++                )
++            obj.file_path = None
++            obj.documents = None
++            results = await self.add_external_corpus_communicator(obj)
++            all_success, all_message = _Communicator.merge_results(results)
++            if truncated and all_success:
++                all_message += f" (truncated: exceeded {max_tokens} token limit)"
++            return AddExternalCorpusReqOutput(
++                success=all_success,
++                corpus_id=results[0].corpus_id if all_success else "",
++                message=all_message,
++                loaded_token_count=results[0].loaded_token_count if all_success else 0,
++            )
++        except Exception as e:
++            return AddExternalCorpusReqOutput(success=False, message=str(e))
++
++    async def remove_external_corpus(
++        self: TokenizerManager, corpus_id: str
++    ) -> RemoveExternalCorpusReqOutput:
++        self.auto_create_handle_loop()
++        if self.server_args.speculative_algorithm != "NGRAM":
++            return RemoveExternalCorpusReqOutput(
++                success=False,
++                message="Ngram speculative decoding is not enabled.",
++            )
++        results = await self.remove_external_corpus_communicator(
++            RemoveExternalCorpusReqInput(corpus_id=corpus_id)
++        )
++        all_success, all_message = _Communicator.merge_results(results)
++        return RemoveExternalCorpusReqOutput(success=all_success, message=all_message)
++
++    async def list_external_corpora(
++        self: TokenizerManager,
++    ) -> ListExternalCorporaReqOutput:
++        self.auto_create_handle_loop()
++        if self.server_args.speculative_algorithm != "NGRAM":
++            return ListExternalCorporaReqOutput(
++                success=False,
++                message="Ngram speculative decoding is not enabled.",
++            )
++        results = await self.list_external_corpora_communicator(
++            ListExternalCorporaReqInput()
++        )
++        all_success, all_message = _Communicator.merge_results(results)
++        # Merge corpus token counts from all DP ranks (each rank loads the same set).
++        corpus_token_counts = results[0].corpus_token_counts if all_success else {}
++        return ListExternalCorporaReqOutput(
++            success=all_success,
++            corpus_token_counts=corpus_token_counts,
++            message=all_message,
++        )
++
+     async def flush_cache(
+         self: TokenizerManager, timeout_s: Optional[float] = None
+     ) -> FlushCacheReqOutput:
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index d91ced805..7d62a2ccd 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -512,6 +512,9 @@ class ServerArgs:
+     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
+     speculative_ngram_max_trie_depth: int = 18
+     speculative_ngram_capacity: int = 10 * 1000 * 1000
++    speculative_ngram_external_corpus_path: Optional[str] = None
++    speculative_ngram_external_sam_budget: int = 0
++    speculative_ngram_external_corpus_max_tokens: int = 10000000
+     enable_multi_layer_eagle: bool = False
+
+     # Expert parallelism
+@@ -3110,6 +3113,25 @@ class ServerArgs:
+                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
+                     "You can override this by explicitly setting --speculative-num-draft-tokens."
+                 )
++            if self.speculative_ngram_external_corpus_path is not None:
++                if self.speculative_ngram_external_sam_budget <= 0:
++                    raise ValueError(
++                        "--speculative-ngram-external-sam-budget must be positive when "
++                        "--speculative-ngram-external-corpus-path is set."
++                    )
++                if self.speculative_ngram_external_corpus_max_tokens <= 0:
++                    raise ValueError(
++                        "--speculative-ngram-external-corpus-max-tokens must be positive when "
++                        "--speculative-ngram-external-corpus-path is set."
++                    )
++                if (
++                    self.speculative_ngram_external_sam_budget
++                    > self.speculative_num_draft_tokens - 1
++                ):
++                    raise ValueError(
++                        "speculative_ngram_external_sam_budget must be less than or equal to "
++                        f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
++                    )
+             logger.warning(
+                 "The overlap scheduler and mixed chunked prefill are disabled because of "
+                 "using ngram speculative decoding."
+@@ -4888,6 +4910,24 @@ class ServerArgs:
+             default=ServerArgs.speculative_ngram_capacity,
+             help="The cache capacity for ngram speculative decoding.",
+         )
++        parser.add_argument(
++            "--speculative-ngram-external-corpus-path",
++            type=str,
++            default=ServerArgs.speculative_ngram_external_corpus_path,
++            help="Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
++        )
++        parser.add_argument(
++            "--speculative-ngram-external-sam-budget",
++            type=int,
++            default=ServerArgs.speculative_ngram_external_sam_budget,
++            help="Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
++        )
++        parser.add_argument(
++            "--speculative-ngram-external-corpus-max-tokens",
++            type=int,
++            default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
++            help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
++        )
+
+         # Multi-layer Eagle speculative decoding
+         parser.add_argument(
+diff --git a/python/sglang/srt/speculative/cpp_ngram/external_corpus.py b/python/sglang/srt/speculative/cpp_ngram/external_corpus.py
+new file mode 100644
+index 000000000..62445adde
+--- /dev/null
++++ b/python/sglang/srt/speculative/cpp_ngram/external_corpus.py
+@@ -0,0 +1,62 @@
++import json
++from collections.abc import Iterator
++from pathlib import Path
++
++# Must match SuffixAutomaton::kSeparatorToken in suffix_automaton.h.
++SEPARATOR_TOKEN = -(2**31)
++
++# Default chunk size for streaming tokenized documents into the SAM.
++DEFAULT_CHUNK_SIZE = 4096
++
++
++def iter_external_corpus_chunks(
++    path: str, tokenizer, max_tokens: int, chunk_size: int = DEFAULT_CHUNK_SIZE
++) -> Iterator[list[int]]:
++    """Chunk documents and yield fixed-size token chunks from a JSONL corpus file."""
++    corpus_path = Path(path)
++    if not corpus_path.is_file():
++        raise ValueError(f"External ngram corpus path does not exist: {path}")
++    if tokenizer is None:
++        raise ValueError("A tokenizer is required to load an external ngram corpus.")
++    if max_tokens <= 0:
++        raise ValueError("External ngram corpus max tokens must be positive.")
++
++    total_tokens = 0
++    has_previous_doc = False
++    with corpus_path.open("r", encoding="utf-8") as f:
++        for line_no, line in enumerate(f, start=1):
++            if not line.strip():
++                continue
++
++            try:
++                record = json.loads(line)
++            except json.JSONDecodeError as e:
++                raise ValueError(
++                    f"Invalid JSON in external ngram corpus at line {line_no}: {e.msg}"
++                ) from e
++
++            if not isinstance(record, str):
++                raise ValueError(
++                    "Invalid external ngram corpus record at line "
++                    f"{line_no}: expected a JSON string."
++                )
++
++            token_ids = list(tokenizer.encode(record, add_special_tokens=False))
++            if not token_ids:
++                continue
++
++            separator_cost = 1 if has_previous_doc else 0
++            next_total_tokens = total_tokens + separator_cost + len(token_ids)
++            if next_total_tokens > max_tokens:
++                raise ValueError(
++                    "External ngram corpus exceeds the configured token limit "
++                    f"({max_tokens}) at line {line_no} after loading "
++                    f"{total_tokens} tokens."
++                )
++            total_tokens = next_total_tokens
++
++            if has_previous_doc:
++                token_ids = [SEPARATOR_TOKEN] + token_ids
++            for i in range(0, len(token_ids), chunk_size):
++                yield token_ids[i : i + chunk_size]
++            has_previous_doc = True
+diff --git a/python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py b/python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py
+index 0795e3bf4..4ffc299fd 100644
+--- a/python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py
++++ b/python/sglang/srt/speculative/cpp_ngram/ngram_corpus.py
+@@ -1,6 +1,7 @@
+ # -*- coding: utf-8 -*-
+
+ import logging
++from collections.abc import Iterable, Sequence
+ from typing import Dict, List, Tuple
+
+ import numpy as np
+@@ -19,6 +20,8 @@ class NgramCorpus:
+         draft_token_num=8,
+         match_type="BFS",
+         capacity=1000000,
++        external_sam_budget=0,
++        external_corpus_max_tokens=10000000,
+     ) -> None:
+         cls = get_ngram_corpus_cls()
+         self._obj = cls(
+@@ -28,11 +31,16 @@ class NgramCorpus:
+             max_bfs_breadth=max_bfs_breadth,
+             draft_token_num=draft_token_num,
+             match_type=match_type,
++            external_sam_budget=external_sam_budget,
++            external_corpus_max_tokens=external_corpus_max_tokens,
+         )
+         self.default_mask = np.ones((1, 1), dtype=np.int64)
+         self.draft_token_num = draft_token_num
++        self.external_corpus_max_tokens = external_corpus_max_tokens
+         self._req_id_to_state_id: Dict[str, int] = {}
+         self._next_state_id: int = 0
++        self._corpus_token_counts: Dict[str, int] = {}
++        self._total_loaded_tokens: int = 0
+
+     def _get_state_id(self, req_id: str) -> int:
+         sid = self._req_id_to_state_id.get(req_id)
+@@ -48,6 +56,43 @@ class NgramCorpus:
+     def synchronize(self):
+         self._obj.synchronize()  # type: ignore
+
++    @property
++    def remaining_token_budget(self) -> int:
++        return self.external_corpus_max_tokens - self._total_loaded_tokens
++
++    def load_external_corpus_named(
++        self, corpus_id: str, chunks: Iterable[Sequence[int]]
++    ) -> int:
++        if corpus_id in self._corpus_token_counts:
++            raise ValueError(
++                f"External corpus '{corpus_id}' already exists. Remove it before "
++                f"adding a new corpus with the same id."
++            )
++        # Note(kpham-sgl): remaining_token_budget is stale (e.g if there are removes
++        # during the load), which makes the budget more conservative than it should be.
++        # This is acceptable because otherwise load_external_corpus_named would need to check the budget after each chunk,
++        # which would be inefficient.
++        _, loaded_token_count = self._obj.load_external_corpus_named(
++            corpus_id, chunks, self.remaining_token_budget
++        )
++        return loaded_token_count
++
++    # Commit corpus bookkeeping after successful load. Call only at background thread join.
++    # (or after synchronous load_external_corpus_named returns)
++    def commit_external_corpus_load(
++        self, corpus_id: str, loaded_token_count: int
++    ) -> None:
++        self._corpus_token_counts[corpus_id] = loaded_token_count
++        self._total_loaded_tokens += loaded_token_count
++
++    def remove_external_corpus(self, corpus_id: str) -> None:
++        self._obj.remove_corpus(corpus_id)
++        old_count = self._corpus_token_counts.pop(corpus_id, 0)
++        self._total_loaded_tokens -= old_count
++
++    def list_external_corpora(self) -> Dict[str, int]:
++        return self._obj.list_corpora()
++
+     def reset(self):
+         self._obj.reset()  # type: ignore
+         self._req_id_to_state_id.clear()
+diff --git a/python/sglang/srt/speculative/external_corpus_manager.py b/python/sglang/srt/speculative/external_corpus_manager.py
+new file mode 100644
+index 000000000..b268af5e1
+--- /dev/null
++++ b/python/sglang/srt/speculative/external_corpus_manager.py
+@@ -0,0 +1,110 @@
++"""Manages external SAM corpora for ngram speculative decoding.
++
++Handles add/remove/list operations and async background loading.
++Used by the Scheduler — not a mixin, a standalone manager object.
++"""
++
++import logging
++import threading
++from typing import Callable, Optional, Tuple
++
++from sglang.srt.managers.io_struct import (
++    AddExternalCorpusReqInput,
++    AddExternalCorpusReqOutput,
++    ListExternalCorporaReqInput,
++    ListExternalCorporaReqOutput,
++    RemoveExternalCorpusReqInput,
++    RemoveExternalCorpusReqOutput,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class ExternalCorpusManager:
++    """Manages external SAM corpus lifecycle for a single scheduler.
++
++    Args:
++        draft_worker: the NGRAMWorker instance (must have add_external_corpus,
++            remove_external_corpus, list_external_corpora methods).
++        send_response: callable(output, recv_req) to send deferred responses
++            back to the tokenizer manager.
++    """
++
++    def __init__(self, draft_worker, send_response: Callable):
++        self._worker = draft_worker
++        self._send_response = send_response
++        self._pending_load: Optional[
++            Tuple[AddExternalCorpusReqInput, threading.Thread]
++        ] = None
++        self._load_result: Optional[AddExternalCorpusReqOutput] = None
++
++    def check_pending_load(self):
++        """Poll from the scheduler event loop. Sends response when done."""
++        if self._pending_load is None:
++            return
++        recv_req, thread = self._pending_load
++        if thread.is_alive():
++            return
++        self._pending_load = None
++        thread.join()  # formal happens-before for _load_result visibility
++        result = self._load_result
++        self._load_result = None
++        if result.success:
++            self._worker.commit_corpus_load(result.corpus_id, result.loaded_token_count)
++        self._send_response(result, recv_req)
++
++    def add(
++        self, recv_req: AddExternalCorpusReqInput
++    ) -> Optional[AddExternalCorpusReqOutput]:
++        if self._pending_load is not None:
++            return AddExternalCorpusReqOutput(
++                success=False,
++                message="Another corpus load is already in progress.",
++            )
++
++        def _build():
++            try:
++                loaded = self._worker.add_external_corpus(
++                    recv_req.corpus_id, recv_req.token_chunks
++                )
++                self._load_result = AddExternalCorpusReqOutput(
++                    success=True,
++                    corpus_id=recv_req.corpus_id,
++                    message=f"Loaded corpus '{recv_req.corpus_id}' with {loaded} tokens.",
++                    loaded_token_count=loaded,
++                )
++            except Exception as e:
++                self._load_result = AddExternalCorpusReqOutput(
++                    success=False, message=str(e)
++                )
++
++        thread = threading.Thread(target=_build, daemon=True)
++        self._pending_load = (recv_req, thread)
++        thread.start()
++        return None  # response sent later by check_pending_load
++
++    # FIXME(kpham-sgl): remove a corpus during a pending load is an undefined behaviour
++    # and should be explicitly prevented.
++    def remove(
++        self, recv_req: RemoveExternalCorpusReqInput
++    ) -> RemoveExternalCorpusReqOutput:
++        try:
++            self._worker.remove_external_corpus(recv_req.corpus_id)
++            return RemoveExternalCorpusReqOutput(
++                success=True,
++                message=f"Removed corpus '{recv_req.corpus_id}'.",
++            )
++        except Exception as e:
++            return RemoveExternalCorpusReqOutput(success=False, message=str(e))
++
++    def list(
++        self, recv_req: ListExternalCorporaReqInput
++    ) -> ListExternalCorporaReqOutput:
++        try:
++            token_counts = self._worker.list_external_corpora()
++            return ListExternalCorporaReqOutput(
++                success=True,
++                corpus_token_counts=token_counts,
++            )
++        except Exception as e:
++            return ListExternalCorporaReqOutput(success=False, message=str(e))
+diff --git a/python/sglang/srt/speculative/ngram_worker.py b/python/sglang/srt/speculative/ngram_worker.py
+index cbc958660..d219de746 100644
+--- a/python/sglang/srt/speculative/ngram_worker.py
++++ b/python/sglang/srt/speculative/ngram_worker.py
+@@ -54,11 +54,45 @@ class NGRAMWorker:
+             capacity=server_args.speculative_ngram_capacity,
+             max_trie_depth=server_args.speculative_ngram_max_trie_depth,
+             draft_token_num=server_args.speculative_num_draft_tokens,
++            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
++            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+         )
++        if server_args.speculative_ngram_external_corpus_path is not None:
++            from sglang.srt.speculative.cpp_ngram.external_corpus import (
++                iter_external_corpus_chunks,
++            )
++
++            corpus_path = server_args.speculative_ngram_external_corpus_path
++            chunks = list(
++                iter_external_corpus_chunks(
++                    corpus_path,
++                    target_worker.tokenizer,
++                    server_args.speculative_ngram_external_corpus_max_tokens,
++                )
++            )
++            loaded = self.add_external_corpus(corpus_path, chunks)
++            self.commit_corpus_load(corpus_path, loaded)
++            logger.info(
++                "Loaded external ngram corpus '%s' (%d tokens).",
++                corpus_path,
++                loaded,
++            )
+
+     def clear_cache_pool(self):
+         self.ngram_corpus.reset()
+
++    def add_external_corpus(self, corpus_id: str, token_chunks: list[list[int]]) -> int:
++        return self.ngram_corpus.load_external_corpus_named(corpus_id, token_chunks)
++
++    def commit_corpus_load(self, corpus_id: str, loaded_token_count: int) -> None:
++        self.ngram_corpus.commit_external_corpus_load(corpus_id, loaded_token_count)
++
++    def remove_external_corpus(self, corpus_id: str) -> None:
++        self.ngram_corpus.remove_external_corpus(corpus_id)
++
++    def list_external_corpora(self) -> dict[str, int]:
++        return self.ngram_corpus.list_external_corpora()
++
+     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
+         seq2_len = len(seq2)
+         if seq2_len >= n:
+diff --git a/test/registered/spec/test_ngram_speculative_decoding.py b/test/registered/spec/test_ngram_speculative_decoding.py
+index 63c75b116..f80b1e646 100644
+--- a/test/registered/spec/test_ngram_speculative_decoding.py
++++ b/test/registered/spec/test_ngram_speculative_decoding.py
+@@ -1,5 +1,7 @@
+ import unittest
+
++import requests
++
+ from sglang.srt.environ import envs
+ from sglang.srt.utils import kill_process_tree
+ from sglang.test.ci.ci_register import register_cuda_ci
+@@ -71,7 +73,78 @@ class TestNgramSpeculativeDecodingTriton(TestNgramSpeculativeDecodingBase):
+ class TestNgramSpeculativeDecodingFlashinfer(TestNgramSpeculativeDecodingBase):
+     @classmethod
+     def get_server_args(cls):
+-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "flashinfer"]
++        return DEFAULT_SERVER_ARGS + [
++            "--attention-backend",
++            "flashinfer",
++            "--speculative-ngram-external-sam-budget",
++            "8",
++        ]
++
++    def test_output_as_corpus_boosts_accept_length(self):
++        """Baseline → HTTP add corpus → verify accept length boost."""
++        prompts = [
++            "The capital of France is",
++            "In mathematics, the Pythagorean theorem states that",
++            "The speed of light in a vacuum is approximately",
++            "Water boils at a temperature of",
++            "The largest planet in our solar system is",
++        ]
++        max_new_tokens = 128
++        num_rounds = 3
++
++        def generate_batch():
++            outputs = []
++            for prompt in prompts:
++                resp = requests.post(
++                    self.base_url + "/generate",
++                    json={
++                        "text": prompt,
++                        "sampling_params": {
++                            "temperature": 0,
++                            "max_new_tokens": max_new_tokens,
++                        },
++                    },
++                    timeout=120,
++                )
++                self.assertEqual(resp.status_code, 200, resp.text)
++                outputs.append(resp.json()["text"])
++            return outputs
++
++        def get_accept_length():
++            info = requests.get(self.base_url + "/get_server_info").json()
++            return info["internal_states"][0]["avg_spec_accept_length"]
++
++        # Phase 1: baseline — no SAM corpus loaded, only trie
++        generated_outputs = []
++        for _ in range(num_rounds):
++            generated_outputs = generate_batch()
++        baseline_accept_len = get_accept_length()
++        print(f"\n  Baseline accept length (no SAM): {baseline_accept_len:.2f}")
++
++        # Flush cache so phase 2 starts clean
++        requests.post(self.base_url + "/flush_cache", timeout=30)
++
++        # Phase 2: add generated outputs as corpus via HTTP API
++        resp = requests.post(
++            self.base_url + "/add_external_corpus",
++            json={"corpus_id": "bench", "documents": generated_outputs},
++            timeout=120,
++        )
++        self.assertEqual(resp.status_code, 200, resp.text)
++        self.assertTrue(resp.json()["success"], resp.json().get("message"))
++
++        for _ in range(num_rounds):
++            generate_batch()
++        sam_accept_len = get_accept_length()
++        print(f"  SAM accept length (output as corpus): {sam_accept_len:.2f}")
++        print(f"  Speedup: {sam_accept_len / baseline_accept_len:.2f}x")
++
++        self.assertGreater(
++            sam_accept_len,
++            baseline_accept_len * 2.0,
++            f"SAM accept length ({sam_accept_len:.2f}) should be at least 2x "
++            f"baseline ({baseline_accept_len:.2f}) when corpus matches output",
++        )
+
+
+ class TestNgramSpeculativeDecodingPaged(TestNgramSpeculativeDecodingBase):
+diff --git a/test/registered/unit/server_args/test_server_args.py b/test/registered/unit/server_args/test_server_args.py
+index ff381bd21..a83a2c693 100644
+--- a/test/registered/unit/server_args/test_server_args.py
++++ b/test/registered/unit/server_args/test_server_args.py
+@@ -426,5 +426,56 @@ class TestHiCacheArgs(unittest.TestCase):
+         self.assertEqual(args.decode_attention_backend, "triton")
+
+
++class TestNgramExternalSamArgs(CustomTestCase):
++    def test_prepare_server_args_parses_external_sam_args(self):
++        server_args = prepare_server_args(
++            [
++                "--model-path",
++                "dummy",
++                "--speculative-algorithm",
++                "NGRAM",
++                "--speculative-ngram-external-corpus-path",
++                "/tmp/ngram-corpus.jsonl",
++                "--speculative-ngram-external-sam-budget",
++                "4",
++                "--speculative-ngram-external-corpus-max-tokens",
++                "128",
++            ]
++        )
++        self.assertEqual(
++            server_args.speculative_ngram_external_corpus_path,
++            "/tmp/ngram-corpus.jsonl",
++        )
++        self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
++        self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
++
++    def _make_dummy_ngram_args(self, **overrides):
++        args = ServerArgs(model_path="dummy")
++        args.speculative_algorithm = "NGRAM"
++        args.speculative_num_draft_tokens = 12
++        args.device = "cuda"
++        for key, value in overrides.items():
++            setattr(args, key, value)
++        return args
++
++    def test_external_sam_budget_must_fit_draft_budget(self):
++        with self.assertRaises(ValueError) as context:
++            self._make_dummy_ngram_args(
++                speculative_num_draft_tokens=4,
++                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
++                speculative_ngram_external_sam_budget=4,
++            )._handle_speculative_decoding()
++        self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
++
++    def test_external_corpus_max_tokens_must_be_positive(self):
++        with self.assertRaises(ValueError) as context:
++            self._make_dummy_ngram_args(
++                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
++                speculative_ngram_external_sam_budget=2,
++                speculative_ngram_external_corpus_max_tokens=0,
++            )._handle_speculative_decoding()
++        self.assertIn("external-corpus-max-tokens", str(context.exception))
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/test/registered/unit/spec/test_ngram_corpus.py b/test/registered/unit/spec/test_ngram_corpus.py
+index 94a157183..74db4c784 100644
+--- a/test/registered/unit/spec/test_ngram_corpus.py
++++ b/test/registered/unit/spec/test_ngram_corpus.py
+@@ -1,8 +1,14 @@
++import json
++import os
++import tempfile
+ import unittest
+ import uuid
+
+ import numpy as np
+
++from sglang.srt.speculative.cpp_ngram.external_corpus import (
++    iter_external_corpus_chunks,
++)
+ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+ from sglang.test.ci.ci_register import register_cpu_ci
+ from sglang.test.test_utils import CustomTestCase
+@@ -11,16 +17,33 @@ register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+
+
+ def _make_corpus(match_type="BFS", **kwargs):
++    external_corpus_documents = kwargs.pop("external_corpus_documents", None)
+     defaults = dict(
+         max_trie_depth=12,
+         min_bfs_breadth=1,
+         max_bfs_breadth=8,
+         draft_token_num=8,
+         capacity=100000,
++        external_sam_budget=0,
++        external_corpus_max_tokens=10000000,
+     )
+     defaults.update(kwargs)
+     defaults["match_type"] = match_type
+-    return NgramCorpus(**defaults)
++    corpus = NgramCorpus(**defaults)
++    if external_corpus_documents is not None:
++        from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN
++
++        chunks = []
++        has_prev = False
++        for doc in external_corpus_documents:
++            if has_prev:
++                chunks.append([SEPARATOR_TOKEN] + list(doc))
++            else:
++                chunks.append(list(doc))
++            has_prev = True
++        loaded_token_count = corpus.load_external_corpus_named("test_corpus", chunks)
++        corpus.commit_external_corpus_load("test_corpus", loaded_token_count)
++    return corpus
+
+
+ def _batch_get(
+@@ -43,6 +66,12 @@ def _batch_get_with_state(
+     return corpus.batch_get([req_id], [current_tokens], [total_len])
+
+
++class _IntTokenizer:
++    def encode(self, text: str, add_special_tokens: bool = False):
++        del add_special_tokens
++        return [int(piece) for piece in text.split()]
++
++
+ SEED_SEQUENCES = [
+     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+     [1, 2, 3, 44, 55, 66, 77, 88, 99, 100],
+@@ -674,6 +703,153 @@ class TestNgramCorpusIncremental(CustomTestCase):
+         np.testing.assert_array_equal(inc_masks, full_masks)
+
+
++class TestNgramCorpusExternalSam(CustomTestCase):
++    """Verify external SAM loading and fixed-budget composition."""
++
++    def test_external_corpus_iterator_streams_documents(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_max_tokens=8,
++        )
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
++            f.write(json.dumps("1 2 3 4 5"))
++            f.write("\n")
++            f.write(json.dumps("8 9"))
++            f.write("\n")
++            path = f.name
++        self.addCleanup(os.remove, path)
++
++        loaded_token_count = corpus.load_external_corpus_named(
++            path,
++            iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=8),
++        )
++        corpus.commit_external_corpus_load(path, loaded_token_count)
++        # 5 doc tokens + 1 separator + 2 doc tokens = 8
++        self.assertEqual(loaded_token_count, 8)
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 3)
++        self.assertEqual(ids_list[1:3], [4, 5])
++
++    def test_external_corpus_iterator_rejects_oversized_corpus(self):
++        corpus = _make_corpus(
++            "BFS",
++            external_sam_budget=2,
++            external_corpus_max_tokens=4,
++        )
++        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
++            f.write(json.dumps("1 2 3"))
++            f.write("\n")
++            f.write(json.dumps("4 5"))
++            f.write("\n")
++            path = f.name
++        self.addCleanup(os.remove, path)
++
++        with self.assertRaisesRegex(ValueError, "token limit"):
++            corpus.load_external_corpus_named(
++                path,
++                iter_external_corpus_chunks(path, _IntTokenizer(), max_tokens=4),
++            )
++
++    def test_external_sam_only_chain(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_documents=[[1, 2, 3, 4, 5]],
++        )
++
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 3)
++        self.assertEqual(ids_list[1:3], [4, 5])
++
++    def test_external_sam_respects_document_boundaries(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_documents=[[1, 2, 3], [4, 5, 6]],
++        )
++
++        ids, _ = _batch_get(corpus, [[2, 3]])
++        ids_list = ids.tolist()
++        self.assertEqual(ids_list[0], 3)
++        self.assertTrue(all(token == 0 for token in ids_list[1:]), ids_list)
++
++    def test_external_sam_adds_distinct_root_branch(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=6,
++            external_sam_budget=2,
++            external_corpus_documents=[[1, 2, 3, 20, 21]],
++        )
++        corpus.batch_put([[1, 2, 3, 10, 11]])
++        corpus.synchronize()
++
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        leaf_paths = corpus.leaf_paths_from_mask(
++            ids.tolist(), masks.reshape(6, 6).tolist()
++        )
++        self.assertIn([3, 10, 11], leaf_paths)
++        self.assertIn([3, 20, 21], leaf_paths)
++
++    def test_shared_prefix_keeps_both_branches(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=5,
++            external_sam_budget=2,
++            external_corpus_documents=[[1, 2, 3, 10, 99]],
++        )
++        corpus.batch_put([[1, 2, 3, 10, 11]])
++        corpus.synchronize()
++
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        leaf_paths = corpus.leaf_paths_from_mask(
++            ids.tolist(), masks.reshape(5, 5).tolist()
++        )
++        self.assertIn([3, 10, 11], leaf_paths)
++        self.assertIn([3, 10, 99], leaf_paths)
++
++    def test_shared_prefix_merge_can_underfill_budget(self):
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=6,
++            external_sam_budget=2,
++            external_corpus_documents=[[1, 2, 3, 10, 99]],
++        )
++        corpus.batch_put([[1, 2, 3, 10, 11]])
++        corpus.synchronize()
++
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        ids_list = ids.tolist()
++        leaf_paths = corpus.leaf_paths_from_mask(ids_list, masks.reshape(6, 6).tolist())
++        self.assertIn([3, 10, 11], leaf_paths)
++        self.assertIn([3, 10, 99], leaf_paths)
++        self.assertEqual(ids_list.count(0), 2, ids_list)
++
++    def test_external_sam_prob_prefers_frequent_continuation(self):
++        corpus = _make_corpus(
++            "PROB",
++            draft_token_num=2,
++            min_bfs_breadth=1,
++            max_bfs_breadth=1,
++            external_sam_budget=1,
++            external_corpus_documents=[
++                [1, 2, 3, 10],
++                [1, 2, 3, 20],
++                [1, 2, 3, 20],
++                [1, 2, 3, 20],
++            ],
++        )
++
++        ids, _ = _batch_get(corpus, [[1, 2, 3]])
++        self.assertEqual(ids.tolist(), [3, 20])
++
++
+ class TestNgramCorpusMatchBenchmark(CustomTestCase):
+     """Benchmark incremental advance vs full rebuild in match()."""
+
+@@ -738,5 +914,248 @@ class TestNgramCorpusMatchBenchmark(CustomTestCase):
+         )
+
+
++class TestNgramCorpusMultiSam(CustomTestCase):
++    """Verify multi-SAM add/remove/list and budget splitting."""
++
++    def test_add_and_list(self):
++        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++        loaded_token_count = corpus.load_external_corpus_named(
++            "b", [[10, 20, 30, 40, 50]]
++        )
++        corpus.commit_external_corpus_load("b", loaded_token_count)
++        token_counts = corpus.list_external_corpora()
++        self.assertEqual(sorted(token_counts.keys()), ["a", "b"])
++        self.assertEqual(token_counts["a"], 5)
++        self.assertEqual(token_counts["b"], 5)
++
++    def test_remove(self):
++        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++        loaded_token_count = corpus.load_external_corpus_named(
++            "b", [[10, 20, 30, 40, 50]]
++        )
++        corpus.commit_external_corpus_load("b", loaded_token_count)
++        corpus.remove_external_corpus("a")
++        self.assertEqual(list(corpus.list_external_corpora().keys()), ["b"])
++
++    def test_remove_nonexistent_is_noop(self):
++        corpus = _make_corpus("BFS", draft_token_num=4, external_sam_budget=3)
++        corpus.remove_external_corpus("nonexistent")
++        self.assertEqual(corpus.list_external_corpora(), {})
++
++    def test_multi_sam_candidates(self):
++        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++        loaded_token_count = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
++        corpus.commit_external_corpus_load("b", loaded_token_count)
++
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        leaf_paths = corpus.leaf_paths_from_mask(
++            ids.tolist(), masks.reshape(6, 6).tolist()
++        )
++        # Both SAMs should contribute candidates
++        self.assertIn([3, 10, 11], leaf_paths)
++        self.assertIn([3, 20, 21], leaf_paths)
++
++    def test_remove_reduces_candidates(self):
++        corpus = _make_corpus("BFS", draft_token_num=6, external_sam_budget=4)
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 10, 11]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++        loaded_token_count = corpus.load_external_corpus_named("b", [[1, 2, 3, 20, 21]])
++        corpus.commit_external_corpus_load("b", loaded_token_count)
++
++        corpus.remove_external_corpus("b")
++
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        leaf_paths = corpus.leaf_paths_from_mask(
++            ids.tolist(), masks.reshape(6, 6).tolist()
++        )
++        self.assertIn([3, 10, 11], leaf_paths)
++        self.assertNotIn([3, 20, 21], leaf_paths)
++
++    def test_make_corpus_with_documents(self):
++        """_make_corpus helper loads documents as a named corpus."""
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_documents=[[1, 2, 3, 4, 5]],
++        )
++        token_counts = corpus.list_external_corpora()
++        self.assertIn("test_corpus", token_counts)
++
++    def test_remove_frees_token_budget(self):
++        """Removing a corpus should free its tokens from the total budget."""
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_max_tokens=10,
++        )
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++        loaded_token_count = corpus.load_external_corpus_named(
++            "b", [[10, 20, 30, 40, 50]]
++        )
++        corpus.commit_external_corpus_load("b", loaded_token_count)
++        self.assertEqual(corpus.remaining_token_budget, 0)
++
++        corpus.remove_external_corpus("a")
++        self.assertEqual(corpus.remaining_token_budget, 5)
++
++        # Now there's room for a new corpus.
++        loaded_token_count = corpus.load_external_corpus_named("c", [[100, 200, 300]])
++        corpus.commit_external_corpus_load("c", loaded_token_count)
++        self.assertEqual(sorted(corpus.list_external_corpora().keys()), ["b", "c"])
++
++    def test_duplicate_corpus_id_is_rejected(self):
++        """Adding a duplicate corpus_id should fail without replacing the original corpus."""
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_max_tokens=10,
++        )
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++        with self.assertRaisesRegex(ValueError, "already exists"):
++            corpus.load_external_corpus_named("a", [[10, 20, 30]])
++
++        self.assertEqual(corpus.remaining_token_budget, 5)
++        self.assertEqual(list(corpus.list_external_corpora().keys()), ["a"])
++
++        # The original corpus must still be usable for matching.
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        leaf_paths = corpus.leaf_paths_from_mask(
++            ids.tolist(), masks.reshape(4, 4).tolist()
++        )
++        self.assertTrue(
++            any(4 in path or 5 in path for path in leaf_paths),
++            f"Expected tokens from corpus 'a' in {leaf_paths}",
++        )
++
++    def test_error_on_load_preserves_existing_corpora(self):
++        """A failed load must not wipe previously loaded corpora (staging-only cleanup)."""
++        corpus = _make_corpus(
++            "BFS",
++            draft_token_num=4,
++            external_sam_budget=3,
++            external_corpus_max_tokens=10,
++        )
++        loaded_token_count = corpus.load_external_corpus_named("a", [[1, 2, 3, 4, 5]])
++        corpus.commit_external_corpus_load("a", loaded_token_count)
++
++        # Force an error by exceeding the budget.
++        with self.assertRaises(ValueError):
++            corpus.load_external_corpus_named("b", [[10, 20, 30, 40, 50, 60]])
++
++        self.assertEqual(list(corpus.list_external_corpora().keys()), ["a"])
++        self.assertEqual(corpus.remaining_token_budget, 5)
++
++        # "a" must still be usable for matching.
++        ids, masks = _batch_get(corpus, [[1, 2, 3]])
++        leaf_paths = corpus.leaf_paths_from_mask(
++            ids.tolist(), masks.reshape(4, 4).tolist()
++        )
++        # Should still find continuations from corpus "a".
++        self.assertTrue(
++            any(4 in path or 5 in path for path in leaf_paths),
++            f"Expected tokens from corpus 'a' in {leaf_paths}",
++        )
++
++
++class TestMultiSamHttpMock(CustomTestCase):
++    """Test HTTP endpoints for multi-SAM management with a mocked backend."""
++
++    @classmethod
++    def setUpClass(cls):
++        from unittest.mock import AsyncMock, MagicMock
++
++        try:
++            from starlette.testclient import TestClient
++
++            from sglang.srt.entrypoints.http_server import app, set_global_state
++        except (ImportError, OSError):
++            raise unittest.SkipTest(
++                "http_server import requires CUDA libraries not available on CPU"
++            )
++        from sglang.srt.managers.io_struct import (
++            AddExternalCorpusReqOutput,
++            ListExternalCorporaReqOutput,
++            RemoveExternalCorpusReqOutput,
++        )
++
++        mock_state = MagicMock()
++        tm = mock_state.tokenizer_manager
++
++        # Wire up async methods that the HTTP handlers call
++        tm.add_external_corpus = AsyncMock(
++            return_value=AddExternalCorpusReqOutput(
++                success=True,
++                corpus_id="test-id",
++                message="Loaded corpus 'test-id' with 100 tokens.",
++                loaded_token_count=100,
++            )
++        )
++        tm.remove_external_corpus = AsyncMock(
++            return_value=RemoveExternalCorpusReqOutput(
++                success=True, message="Removed corpus 'test-id'."
++            )
++        )
++        tm.list_external_corpora = AsyncMock(
++            return_value=ListExternalCorporaReqOutput(
++                success=True, corpus_token_counts={"a": 100, "b": 200}
++            )
++        )
++        set_global_state(mock_state)
++        cls.client = TestClient(app)
++        cls.mock_tm = tm
++
++    def test_add_corpus(self):
++        resp = self.client.post(
++            "/add_external_corpus",
++            json={"corpus_id": "my-corpus", "documents": ["hello world"]},
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = resp.json()
++        self.assertTrue(data["success"])
++        self.assertEqual(data["corpus_id"], "test-id")
++        self.assertEqual(data["loaded_token_count"], 100)
++
++    def test_add_corpus_auto_id(self):
++        resp = self.client.post(
++            "/add_external_corpus",
++            json={"documents": ["hello world"]},
++        )
++        self.assertEqual(resp.status_code, 200)
++        self.assertTrue(resp.json()["success"])
++
++    def test_remove_corpus(self):
++        resp = self.client.post(
++            "/remove_external_corpus",
++            json={"corpus_id": "test-id"},
++        )
++        self.assertEqual(resp.status_code, 200)
++        self.assertTrue(resp.json()["success"])
++
++    def test_remove_corpus_missing_id(self):
++        resp = self.client.post(
++            "/remove_external_corpus",
++            json={},
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_list_corpora(self):
++        resp = self.client.get("/list_external_corpora")
++        self.assertEqual(resp.status_code, 200)
++        data = resp.json()
++        self.assertTrue(data["success"])
++        self.assertEqual(data["corpus_token_counts"], {"a": 100, "b": 200})
++
++
+ if __name__ == "__main__":
+     unittest.main(verbosity=3)

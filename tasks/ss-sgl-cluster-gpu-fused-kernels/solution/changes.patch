@@ -1,0 +1,1143 @@
+diff --git a/benchmark/bench_linear_attention/bench_gdn_qkv_split.py b/benchmark/bench_linear_attention/bench_gdn_qkv_split.py
+new file mode 100644
+index 0000000000..30aaf9e26b
+--- /dev/null
++++ b/benchmark/bench_linear_attention/bench_gdn_qkv_split.py
+@@ -0,0 +1,139 @@
++from __future__ import annotations
++
++import argparse
++
++import torch
++
++from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
++
++DTYPES = {
++    "bf16": torch.bfloat16,
++    "fp16": torch.float16,
++    "fp32": torch.float32,
++}
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(
++        description="Benchmark GDN prefill QKV split fallback vs fused Triton path."
++    )
++    parser.add_argument("--seq-len", type=int, default=8192)
++    parser.add_argument("--num-q-heads", type=int, default=16)
++    parser.add_argument("--num-k-heads", type=int, default=16)
++    parser.add_argument("--num-v-heads", type=int, default=16)
++    parser.add_argument("--head-q", type=int, default=128)
++    parser.add_argument("--head-k", type=int, default=128)
++    parser.add_argument("--head-v", type=int, default=128)
++    parser.add_argument("--dtype", choices=DTYPES.keys(), default="bf16")
++    parser.add_argument("--warmup", type=int, default=20)
++    parser.add_argument("--iters", type=int, default=100)
++    return parser.parse_args()
++
++
++def make_non_contiguous_view(src: torch.Tensor) -> torch.Tensor:
++    backing = torch.empty(
++        src.shape[1],
++        src.shape[0],
++        dtype=src.dtype,
++        device=src.device,
++    )
++    view = backing.transpose(0, 1)
++    view.copy_(src)
++    return view
++
++
++def split_reference(
++    mixed_qkv: torch.Tensor,
++    num_q_heads: int,
++    num_k_heads: int,
++    num_v_heads: int,
++    head_q: int,
++    head_k: int,
++    head_v: int,
++):
++    q_dim = num_q_heads * head_q
++    k_dim = num_k_heads * head_k
++    v_dim = num_v_heads * head_v
++    actual_seq_len = mixed_qkv.shape[0]
++    query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
++    query = query.reshape(1, actual_seq_len, num_q_heads, head_q).contiguous()
++    key = key.reshape(1, actual_seq_len, num_k_heads, head_k).contiguous()
++    value = value.reshape(1, actual_seq_len, num_v_heads, head_v).contiguous()
++    return query, key, value
++
++
++@torch.inference_mode()
++def benchmark(fn, warmup: int, iters: int) -> float:
++    for _ in range(warmup):
++        fn()
++    torch.cuda.synchronize()
++
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    for _ in range(iters):
++        fn()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) * 1000.0 / iters
++
++
++def check_close(actual, expected):
++    for actual_tensor, expected_tensor in zip(actual, expected):
++        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
++
++
++def run_case(name: str, mixed_qkv: torch.Tensor, args):
++    shape_args = (
++        args.num_q_heads,
++        args.num_k_heads,
++        args.num_v_heads,
++        args.head_q,
++        args.head_k,
++        args.head_v,
++    )
++    expected = split_reference(mixed_qkv, *shape_args)
++    actual = fused_qkv_split_gdn_prefill(mixed_qkv, *shape_args)
++    check_close(actual, expected)
++
++    baseline_us = benchmark(
++        lambda: split_reference(mixed_qkv, *shape_args),
++        args.warmup,
++        args.iters,
++    )
++    fused_us = benchmark(
++        lambda: fused_qkv_split_gdn_prefill(mixed_qkv, *shape_args),
++        args.warmup,
++        args.iters,
++    )
++    speedup = baseline_us / fused_us
++    print(f"{name:>12} {baseline_us:12.2f} {fused_us:12.2f} {speedup:10.2f}x")
++
++
++def main():
++    args = parse_args()
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA is required for this benchmark")
++
++    torch.manual_seed(0)
++    device = torch.device("cuda")
++    dtype = DTYPES[args.dtype]
++    qkv_dim = (
++        args.num_q_heads * args.head_q
++        + args.num_k_heads * args.head_k
++        + args.num_v_heads * args.head_v
++    )
++    mixed_qkv = torch.randn(args.seq_len, qkv_dim, dtype=dtype, device=device)
++    mixed_qkv_strided = make_non_contiguous_view(mixed_qkv)
++
++    print(
++        f"seq_len={args.seq_len} qkv_dim={qkv_dim} dtype={args.dtype} "
++        f"warmup={args.warmup} iters={args.iters}"
++    )
++    print(f"{'layout':>12} {'baseline_us':>12} {'fused_us':>12} {'speedup':>11}")
++    run_case("contiguous", mixed_qkv, args)
++    run_case("strided", mixed_qkv_strided, args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/sglang/jit_kernel/triton/gdn_fused_proj.py b/python/sglang/jit_kernel/triton/gdn_fused_proj.py
+index d7d07da739..076a1cc3f7 100644
+--- a/python/sglang/jit_kernel/triton/gdn_fused_proj.py
++++ b/python/sglang/jit_kernel/triton/gdn_fused_proj.py
+@@ -308,3 +308,100 @@ def fused_qkvzba_split_reshape_cat_contiguous(
+         num_stages=3,
+     )
+     return mixed_qkv, z, b, a
++
++
++@triton.jit
++def fused_qkv_split_gdn_prefill_kernel(
++    q,
++    k,
++    v,
++    mixed_qkv,
++    MIXED_QKV_STRIDE_T: tl.constexpr,
++    MIXED_QKV_STRIDE_D: tl.constexpr,
++    NUM_Q_HEADS: tl.constexpr,
++    NUM_K_HEADS: tl.constexpr,
++    NUM_V_HEADS: tl.constexpr,
++    HEAD_Q: tl.constexpr,
++    HEAD_K: tl.constexpr,
++    HEAD_V: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    i_t = tl.program_id(0)
++    offsets = tl.arange(0, BLOCK_SIZE)
++
++    q_dim: tl.constexpr = NUM_Q_HEADS * HEAD_Q
++    k_dim: tl.constexpr = NUM_K_HEADS * HEAD_K
++    v_dim: tl.constexpr = NUM_V_HEADS * HEAD_V
++    qk_dim: tl.constexpr = q_dim + k_dim
++    qkv_dim: tl.constexpr = qk_dim + v_dim
++
++    mask = offsets < qkv_dim
++    values = tl.load(
++        mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
++        mask=mask,
++    )
++
++    q_mask = offsets < q_dim
++    tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
++
++    k_offsets = offsets - q_dim
++    k_mask = (offsets >= q_dim) & (offsets < qk_dim)
++    tl.store(k + i_t * k_dim + k_offsets, values, mask=k_mask)
++
++    v_offsets = offsets - qk_dim
++    v_mask = (offsets >= qk_dim) & (offsets < qkv_dim)
++    tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
++
++
++def fused_qkv_split_gdn_prefill(
++    mixed_qkv: torch.Tensor,
++    num_q_heads: int,
++    num_k_heads: int,
++    num_v_heads: int,
++    head_q: int,
++    head_k: int,
++    head_v: int,
++):
++    """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
++
++    `mixed_qkv` is laid out per token as `[all_q | all_k | all_v]`. The FLA
++    chunk kernels consume separate contiguous `[1, T, H, D]` tensors, so this
++    fused split replaces three independent `aten::copy_` kernels from the
++    generic FLA input guard. `mixed_qkv` may be a strided `[T, qkv_dim]` view.
++    """
++    seq_len = mixed_qkv.shape[0]
++    q = torch.empty(
++        (1, seq_len, num_q_heads, head_q),
++        dtype=mixed_qkv.dtype,
++        device=mixed_qkv.device,
++    )
++    k = torch.empty(
++        (1, seq_len, num_k_heads, head_k),
++        dtype=mixed_qkv.dtype,
++        device=mixed_qkv.device,
++    )
++    v = torch.empty(
++        (1, seq_len, num_v_heads, head_v),
++        dtype=mixed_qkv.dtype,
++        device=mixed_qkv.device,
++    )
++
++    qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
++    fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
++        q,
++        k,
++        v,
++        mixed_qkv,
++        mixed_qkv.stride(0),
++        mixed_qkv.stride(1),
++        num_q_heads,
++        num_k_heads,
++        num_v_heads,
++        head_q,
++        head_k,
++        head_v,
++        BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
++        num_warps=8,
++        num_stages=3,
++    )
++    return q, k, v
+diff --git a/python/sglang/srt/layers/attention/fla/chunk_delta_h.py b/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
+index 5feb339060..fec725d01e 100644
+--- a/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
++++ b/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
+@@ -2,6 +2,7 @@
+ # -*- coding: utf-8 -*-
+ # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+ 
++import os
+ from typing import Optional, Tuple
+ 
+ import torch
+@@ -20,6 +21,9 @@ from sglang.srt.layers.attention.fla.utils import (
+ 
+ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
+ CHUNK_SIZE = 64
++GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
++GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
++GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+ 
+ 
+ @triton.autotune(
+@@ -32,8 +36,16 @@ CHUNK_SIZE = 64
+     # because cloning the cache pool for each benchmark exceeds available memory.
+     # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
+     # future per-bucket configs once the kernel is refactored to write final
+-    # state to a separate output buffer).
+-    configs=[triton.Config({"BV": 32}, num_warps=4, num_stages=2)],
++    # state to a separate output buffer). The env knobs keep this single-config
++    # property while allowing model/hardware-local validation of the selected
++    # tile without corrupting the state pool through multi-config autotune.
++    configs=[
++        triton.Config(
++            {"BV": GDN_CHUNK_H_BV},
++            num_warps=GDN_CHUNK_H_NUM_WARPS,
++            num_stages=GDN_CHUNK_H_NUM_STAGES,
++        )
++    ],
+     key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
+     **autotune_cache_kwargs,
+ )
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index 1f463430e4..48f6cf90bc 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -26,6 +26,11 @@ if not is_cpu():
+         CHUNK_SIZE as FLA_CHUNK_SIZE,
+     )
+ 
++if is_cuda():
++    from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkv_split_gdn_prefill
++
++MAX_FUSED_QKV_SPLIT_DIM = 8192
++
+ if is_cuda():
+     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+         causal_conv1d_fn as causal_conv1d_fn_cuda,
+@@ -422,16 +427,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
+                 seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+             ).transpose(0, 1)[:seq_len]
+ 
+-        query, key, value = torch.split(
+-            mixed_qkv,
+-            [layer.q_dim, layer.k_dim, layer.v_dim],
+-            dim=-1,
+-        )
+-
+-        actual_seq_len = query.shape[0]
+-        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+-        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+-        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
++        actual_seq_len = mixed_qkv.shape[0]
++        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
++        if is_cuda() and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
++            query, key, value = fused_qkv_split_gdn_prefill(
++                mixed_qkv,
++                layer.num_q_heads,
++                layer.num_k_heads,
++                layer.num_v_heads,
++                layer.head_q_dim,
++                layer.head_k_dim,
++                layer.head_v_dim,
++            )
++        else:
++            query, key, value = torch.split(
++                mixed_qkv,
++                [layer.q_dim, layer.k_dim, layer.v_dim],
++                dim=-1,
++            )
++            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
++            key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
++            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+ 
+         if is_target_verify:
+             core_attn_out = self.kernel_dispatcher.target_verify(
+diff --git a/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py b/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+index 02c31cf151..f0cc1a44be 100644
+--- a/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
++++ b/python/sglang/srt/layers/deep_gemm_wrapper/compile_utils.py
+@@ -97,6 +97,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+ class DeepGemmKernelType(IntEnum):
+     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
+     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
++    GROUPED_GEMM_NT_BF16_MASKED = auto()
++    GROUPED_GEMM_NT_BF16_CONTIG = auto()
+     GEMM_NT_F8F8BF16 = auto()
+     GEMM_NT_BF16BF16F32 = auto()
+ 
+@@ -164,6 +166,9 @@ def _compile_deep_gemm_one_type_all(
+         if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
++        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
++            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
++            m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+ 
+         # Here the precompilation is only run on the first rank, so gpu_id should be 0
+         memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+@@ -226,6 +231,8 @@ class _BaseWarmupExecutor:
+             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
+             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
++            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
++            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
+         }[kernel_type](**kwargs)
+ 
+     @staticmethod
+@@ -238,6 +245,10 @@ class _BaseWarmupExecutor:
+             return (max_m * k + n * k + max_m * n * 2) / _GB
+         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
++        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
++            return (
++                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
++            ) / _GB
+         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+             return (
+                 num_groups * max_m * k
+@@ -248,6 +259,13 @@ class _BaseWarmupExecutor:
+         elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
+             # bf16 lhs + bf16 rhs + fp32 out
+             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
++        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
++            return (
++                num_groups * max_m * k * 2
++                + num_groups * n * k * 2
++                + num_groups * 4
++                + num_groups * max_m * n * 2
++            ) / _GB
+         else:
+             raise ValueError(f"Invalid kernel type: {kernel_type}")
+ 
+@@ -310,6 +328,22 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
+         )
+ 
+ 
++class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
++    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
++        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
++        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
++        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
++        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
++
++    def execute(self, m):
++        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
++            self.a[:m],
++            self.b,
++            self.out[:m],
++            m_indices=self.m_indices[:m],
++        )
++
++
+ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
+     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
+@@ -340,6 +374,28 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
+         deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
+ 
+ 
++class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
++    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
++        self.a = torch.empty(
++            (num_groups, max_m, k), device="cuda", dtype=torch.bfloat16
++        )
++        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
++        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
++        self.out = torch.empty(
++            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
++        )
++
++    def execute(self, m):
++        deep_gemm.m_grouped_bf16_gemm_nt_masked(
++            self.a,
++            self.b,
++            self.out,
++            masked_m=self.masked_m,
++            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
++            expected_m=m,
++        )
++
++
+ def deep_gemm_execution_hook(
+     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+ ):
+diff --git a/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py b/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
+index 37499c524a..764b5345bb 100644
+--- a/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
++++ b/python/sglang/srt/layers/deep_gemm_wrapper/entrypoint.py
+@@ -86,6 +86,29 @@ def _ensure_cuda(
+     )
+ 
+ 
++def grouped_gemm_nt_bf16_masked(
++    a: torch.Tensor,
++    b: torch.Tensor,
++    d: torch.Tensor,
++    masked_m: torch.Tensor,
++    expected_m: int,
++):
++    num_groups, _, k = a.shape
++    _, n, _ = b.shape
++    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
++
++    with compile_utils.deep_gemm_execution_hook(
++        expected_m, n, k, num_groups, kernel_type
++    ):
++        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
++            a,
++            b,
++            d,
++            masked_m,
++            expected_m,
++        )
++
++
+ def grouped_gemm_nt_f8f8bf16_contig(
+     lhs: Tuple[torch.Tensor, torch.Tensor],
+     rhs: Tuple[torch.Tensor, torch.Tensor],
+@@ -116,6 +139,17 @@ def grouped_gemm_nt_f8f8bf16_contig(
+         )
+ 
+ 
++def grouped_gemm_nt_bf16_contig(
++    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
++):
++    m, k = a.shape
++    num_groups, n, _ = b.shape
++    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
++
++    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
++        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
++
++
+ def gemm_nt_f8f8bf16(
+     lhs: Tuple[torch.Tensor, torch.Tensor],
+     rhs: Tuple[torch.Tensor, torch.Tensor],
+diff --git a/python/sglang/srt/layers/moe/ep_moe/kernels.py b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+index 40de48e728..7def543f87 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/kernels.py
++++ b/python/sglang/srt/layers/moe/ep_moe/kernels.py
+@@ -431,6 +431,114 @@ def silu_and_mul_masked_post_quant_fwd(
+     return
+ 
+ 
++@triton.jit
++def _silu_and_mul_kernel(
++    input_ptr,
++    stride_input_0,
++    stride_input_1,
++    stride_input_2,
++    output_ptr,
++    stride_output_0,
++    stride_output_1,
++    stride_output_2,
++    masked_m_ptr,
++    size_n,
++    BLOCK_N: tl.constexpr,
++    NUM_STAGE: tl.constexpr,
++):
++    expert_id = tl.program_id(2)
++    token_id = tl.program_id(1)
++    hidden_dim_block_index = tl.program_id(0)
++
++    block_num_per_expert = tl.num_programs(1)
++
++    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
++
++    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
++    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
++    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
++    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
++
++    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
++    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
++    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
++
++    for token_index in tl.range(
++        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
++    ):
++        gate = tl.load(
++            input_ptr_offs + token_index * stride_input_1,
++            mask=offs_in_d < size_n,
++            other=0.0,
++        ).to(tl.float32)
++        up = tl.load(
++            input_ptr_offs + token_index * stride_input_1 + size_n,
++            mask=offs_in_d < size_n,
++            other=0.0,
++        )
++        gate = gate / (1 + tl.exp(-gate))
++        gate = gate.to(input_ptr.dtype.element_ty)
++        gate_up = up * gate
++        tl.store(
++            output_ptr_offs + token_index * stride_output_1,
++            gate_up,
++            mask=offs_in_d < size_n,
++        )
++
++
++def silu_and_mul_masked_fwd(
++    input: torch.Tensor,
++    output: torch.Tensor,
++    masked_m: torch.Tensor,
++):
++    """
++    input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
++    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
++    masked_m shape [expert_num]
++    """
++
++    assert input.is_contiguous()
++    assert output.dtype == torch.bfloat16
++    assert input.dtype == torch.bfloat16
++    assert output.is_contiguous()
++    assert len(input.shape) == 3
++    assert input.shape[0] == masked_m.shape[0]
++    assert input.shape[-1] % 2 == 0
++
++    size_n = input.shape[-1] // 2
++    expert_num = len(masked_m)
++
++    if expert_num < 4:
++        BLOCK_NUM_PER_EXPERT = 64
++    else:
++        BLOCK_NUM_PER_EXPERT = 32
++
++    BLOCK_N = 128
++    num_warps = 4
++    NUM_STAGES = 4
++
++    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
++
++    grid = (
++        hidden_dim_split_block_num,
++        BLOCK_NUM_PER_EXPERT,
++        expert_num,
++    )
++
++    _silu_and_mul_kernel[grid](
++        input,
++        *input.stride(),
++        output,
++        *output.stride(),
++        masked_m,
++        size_n,
++        BLOCK_N=BLOCK_N,
++        NUM_STAGE=NUM_STAGES,
++        num_warps=num_warps,
++    )
++    return output
++
++
+ @triton.jit
+ def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
+     input_ptr,
+@@ -669,6 +777,7 @@ def _fwd_kernel_ep_scatter_2(
+     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+     # Platform-specific semaphore for atomic_add performance tuning
+     ATOMIC_ADD_SEM: tl.constexpr,
++    IS_FP8: tl.constexpr,
+ ):
+     start_token_id = tl.program_id(0)
+     grid_num = tl.num_programs(0)
+@@ -682,12 +791,13 @@ def _fwd_kernel_ep_scatter_2(
+     for token_id_int32 in range(start_token_id, total_token_num, grid_num):
+         token_id = token_id_int32.to(tl.int64)
+         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
+-        to_copy_s = tl.load(
+-            recv_x_scale
+-            + token_id * recv_x_scale_stride0
+-            + index_in_s * recv_x_scale_stride1,
+-            mask=mask_s,
+-        )
++        if IS_FP8:
++            to_copy_s = tl.load(
++                recv_x_scale
++                + token_id * recv_x_scale_stride0
++                + index_in_s * recv_x_scale_stride1,
++                mask=mask_s,
++            )
+ 
+         for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
+             topk_index = topk_idx_int32.to(tl.int64)
+@@ -705,15 +815,18 @@ def _fwd_kernel_ep_scatter_2(
+                 output_tensor_ptr = (
+                     output_tensor + dest_token_index * output_tensor_stride0
+                 )
+-                output_tensor_scale_ptr = (
+-                    output_tensor_scale + dest_token_index * output_tensor_scale_stride0
+-                )
+                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+-                tl.store(
+-                    output_tensor_scale_ptr + index_in_s * output_tensor_scale_stride1,
+-                    to_copy_s,
+-                    mask=mask_s,
+-                )
++                if IS_FP8:
++                    output_tensor_scale_ptr = (
++                        output_tensor_scale
++                        + dest_token_index * output_tensor_scale_stride0
++                    )
++                    tl.store(
++                        output_tensor_scale_ptr
++                        + index_in_s * output_tensor_scale_stride1,
++                        to_copy_s,
++                        mask=mask_s,
++                    )
+ 
+ 
+ # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
+@@ -745,10 +858,15 @@ def ep_scatter(
+         scale_hidden_size = ceil_div(scale_hidden_size, 4)
+ 
+     assert m_indices.shape[0] % BLOCK_E == 0
+-    assert (
+-        recv_x_scale.dtype == output_tensor_scale.dtype
+-    ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+-    assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
++
++    is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
++    if is_fp8:
++        assert (
++            recv_x_scale.dtype == output_tensor_scale.dtype
++        ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
++        assert (
++            recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
++        )
+ 
+     _fwd_kernel_ep_scatter_1[(grid,)](
+         num_recv_tokens_per_expert,
+@@ -769,8 +887,8 @@ def ep_scatter(
+         recv_x.stride(0),
+         recv_x.stride(1),
+         recv_x_scale,
+-        recv_x_scale.stride(0),
+-        recv_x_scale.stride(1),
++        recv_x_scale.stride(0) if is_fp8 else 0,
++        recv_x_scale.stride(1) if is_fp8 else 0,
+         recv_topk,
+         recv_topk.stride(0),
+         recv_topk.stride(1),
+@@ -778,8 +896,8 @@ def ep_scatter(
+         output_tensor.stride(0),
+         output_tensor.stride(1),
+         output_tensor_scale,
+-        output_tensor_scale.stride(0),
+-        output_tensor_scale.stride(1),
++        output_tensor_scale.stride(0) if is_fp8 else 0,
++        output_tensor_scale.stride(1) if is_fp8 else 0,
+         output_index,
+         output_index.stride(0),
+         output_index.stride(1),
+@@ -791,6 +909,7 @@ def ep_scatter(
+         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+         # XXX (MUSA): Atomic add with "relaxed" semaphore on musa backend for better performance
+         ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
++        IS_FP8=is_fp8,
+     )
+     return
+ 
+diff --git a/python/sglang/srt/layers/moe/ep_moe/layer.py b/python/sglang/srt/layers/moe/ep_moe/layer.py
+index f201d453a4..15f5d0847a 100644
+--- a/python/sglang/srt/layers/moe/ep_moe/layer.py
++++ b/python/sglang/srt/layers/moe/ep_moe/layer.py
+@@ -110,6 +110,11 @@ class DeepEPMoE(FusedMoE):
+             quant_config, Fp8Config
+         ):
+             self.deprecate_flag = True
++        elif (
++            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
++            and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
++        ):
++            self.deprecate_flag = True
+         else:
+             self.deprecate_flag = False
+ 
+diff --git a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+index 82543626af..f61b08be5f 100644
+--- a/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
++++ b/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
+@@ -225,6 +225,7 @@ class FusedMoE(torch.nn.Module):
+             get_moe_runner_backend().is_flashinfer_trtllm()
+             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+         )
++        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+ 
+         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
+         # Pad the intermediate_size_per_partition if necessary
+@@ -282,7 +283,9 @@ class FusedMoE(torch.nn.Module):
+                 self.quant_method = quant_config.get_quant_method(self, prefix)
+             if self.quant_method is None:
+                 self.quant_method = UnquantizedFusedMoEMethod(
+-                    self.use_triton_kernels, self.use_flashinfer_trtllm_moe
++                    self.use_triton_kernels,
++                    self.use_flashinfer_trtllm_moe,
++                    self.use_deep_gemm,
+                 )
+ 
+         self.quant_method.create_weights(
+diff --git a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+index cfdee47571..da6f13fcd5 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
++++ b/python/sglang/srt/layers/moe/moe_runner/deep_gemm.py
+@@ -51,6 +51,8 @@ _is_musa = is_musa()
+ # Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
+ if not (_is_npu or _is_hip) and _is_cuda:
+     from sglang.jit_kernel.activation import silu_and_mul as _legacy_silu_and_mul
++elif _is_musa:
++    _silu_and_mul_musa = torch.nn.SwishGLU()
+ else:
+     _legacy_silu_and_mul = None
+ 
+@@ -139,14 +141,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
+         running_state: dict,
+         hooks: Optional[Any] = None,
+     ) -> DeepGemmRunnerOutput:
++        weight_dtype = quant_info.w13_weight.dtype
+         if not runner_input.use_masked_gemm:
+-            hidden_states = self._run_contiguous_gemm(
+-                runner_input, quant_info, running_state
+-            )
++            if weight_dtype == torch.bfloat16:
++                hidden_states = self._run_bf16_contiguous_gemm(
++                    runner_input, quant_info, running_state
++                )
++            else:
++                hidden_states = self._run_contiguous_gemm(
++                    runner_input, quant_info, running_state
++                )
+         else:
+-            hidden_states = self._run_masked_gemm(
+-                runner_input, quant_info, running_state
+-            )
++            if weight_dtype == torch.bfloat16:
++                hidden_states = self._run_masked_bf16_gemm(
++                    runner_input, quant_info, running_state
++                )
++            else:
++                hidden_states = self._run_masked_gemm(
++                    runner_input, quant_info, running_state
++                )
+         return DeepGemmRunnerOutput(hidden_states=hidden_states)
+ 
+     def _run_contiguous_gemm(
+@@ -243,12 +256,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
+                     gateup_output, swiglu_limit=self.swiglu_limit
+                 )
+ 
+-            down_input = torch.empty(
+-                (all_tokens, N // 2),
+-                device=gateup_output.device,
+-                dtype=torch.bfloat16,
+-            )
+-            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
++            if not _is_musa:
++                down_input = torch.empty(
++                    (all_tokens, N // 2),
++                    device=gateup_output.device,
++                    dtype=torch.bfloat16,
++                )
++                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
++            else:
++                down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+             del gateup_output
+ 
+             down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+@@ -279,6 +295,71 @@ class DeepGemmRunnerCore(MoeRunnerCore):
+ 
+         return down_output
+ 
++    def _run_bf16_contiguous_gemm(
++        self,
++        runner_input: DeepGemmRunnerInput,
++        quant_info: DeepGemmMoeQuantInfo,
++        running_state: dict,
++    ) -> torch.Tensor:
++
++        hidden_states = runner_input.hidden_states
++        all_tokens = running_state["all_tokens"]
++        hidden_states_device = running_state["hidden_states_device"]
++        hidden_states_shape = running_state["hidden_states_shape"]
++        m_indices = runner_input.m_indices
++
++        N = quant_info.w13_weight.size(1)
++        K = hidden_states_shape[1]
++
++        w13_weight = quant_info.w13_weight
++        w2_weight = quant_info.w2_weight
++
++        # GroupGemm-1: (M, K) (E, N, K) -> (M, N)
++        gateup_output = torch.empty(
++            (all_tokens, N),
++            device=hidden_states_device,
++            dtype=torch.bfloat16,
++        )
++
++        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
++            hidden_states,
++            w13_weight,
++            gateup_output,
++            m_indices,
++        )
++
++        dispose_tensor(hidden_states)
++
++        # Act: (M, N) -> (M, N/2)
++        if not _is_musa:
++            down_input = torch.empty(
++                (
++                    all_tokens,
++                    N // 2,
++                ),
++                device=gateup_output.device,
++                dtype=torch.bfloat16,
++            )
++            _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
++        else:
++            down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
++        del gateup_output
++
++        # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
++        down_output = torch.empty(
++            (all_tokens, K),
++            device=hidden_states_device,
++            dtype=torch.bfloat16,
++        )
++        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
++            down_input,
++            w2_weight,
++            down_output,
++            m_indices,
++        )
++
++        return down_output
++
+     def _run_masked_gemm(
+         self,
+         runner_input: DeepGemmRunnerInput,
+@@ -413,6 +494,70 @@ class DeepGemmRunnerCore(MoeRunnerCore):
+ 
+         return down_output
+ 
++    def _run_masked_bf16_gemm(
++        self,
++        runner_input: DeepGemmRunnerInput,
++        quant_info: DeepGemmMoeQuantInfo,
++        running_state: dict,
++    ) -> torch.Tensor:
++        from sglang.srt.layers import deep_gemm_wrapper
++        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
++
++        hidden_states = runner_input.hidden_states
++        masked_m = runner_input.masked_m
++        expected_m = runner_input.expected_m
++
++        w13_weight = quant_info.w13_weight
++        w2_weight = quant_info.w2_weight
++
++        hidden_states_device = running_state["hidden_states_device"]
++
++        # GroupGemm-0
++        num_groups, m, k = hidden_states.shape
++        n = w13_weight.size(1)
++        gateup_output = torch.empty(
++            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
++        )
++        deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
++            hidden_states,
++            w13_weight,
++            gateup_output,
++            masked_m,
++            expected_m,
++        )
++        dispose_tensor(hidden_states)
++
++        down_input = torch.empty(
++            (
++                gateup_output.shape[0],
++                gateup_output.shape[1],
++                gateup_output.shape[2] // 2,
++            ),
++            device=hidden_states_device,
++            dtype=torch.bfloat16,
++        )
++
++        # Act
++        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
++        del gateup_output
++
++        # GroupGemm-1
++        n = w2_weight.shape[1]
++
++        down_output = torch.empty(
++            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
++        )
++        deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
++            down_input,
++            w2_weight,
++            down_output,
++            masked_m,
++            expected_m,
++        )
++        # Note: BF16 masked gemm doesn't support overlap_args, so no return value unpack
++
++        return down_output
++
+     @property
+     def runner_backend(self) -> MoeRunnerBackend:
+         return MoeRunnerBackend.DEEP_GEMM
+@@ -632,7 +777,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
+         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+     )
+     dispose_tensor(hidden_states)
+-    dispose_tensor(hidden_states_scale)
++    if hidden_states_scale is not None:
++        dispose_tensor(hidden_states_scale)
+ 
+     running_state["output_index"] = output_index
+ 
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+index 790bc5b01c..a6d0d754c8 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+@@ -397,11 +397,14 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+     ):
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+         topk_ids = topk_ids.to(torch.int64)
+-        if (
+-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+-            and not get_moe_runner_backend().is_cutlass()
+-            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+-        ):
++        backend = get_moe_runner_backend()
++        # BF16 dispatch is needed when:
++        #   - cutlass backend (uses different kernel)
++        #   - deep_gemm backend with SGLANG_DEEPEP_BF16_DISPATCH enabled
++        need_bf16_dispatch = backend.is_cutlass() or (
++            backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
++        )
++        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch:
+             # TODO hard code 128 block quant,use fp8 communication
+             hidden_states = sglang_per_token_group_quant_fp8(
+                 hidden_states,
+@@ -624,14 +627,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+         input_global_scale = self.quant_config.get("input_global_scale", None)
+         if input_global_scale is not None:
+             use_nvfp4 = True
+-        elif not get_moe_runner_backend().is_flashinfer_cutedsl() and (
+-            not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+-        ):
+-            # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
+-            # off; its kernel quantizes to NVFP4 internally.
+-            # SGLANG_DEEPEP_BF16_DISPATCH forces BF16 dispatch for NPU
+-            # where INT8 input + BF16 weight GMM is not supported.
+-            use_fp8 = True
++        else:
++            backend = get_moe_runner_backend()
++            # BF16 dispatch is needed when:
++            #   - flashinfer_cutedsl: kernel quantizes to NVFP4 internally
++            #   - NPU with SGLANG_DEEPEP_BF16_DISPATCH: INT8 input + BF16 weight GMM not supported
++            #   - deep_gemm with SGLANG_DEEPEP_BF16_DISPATCH: user requests BF16 dispatch
++            need_bf16_dispatch = (
++                backend.is_flashinfer_cutedsl()
++                or (_is_npu and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
++                or (backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
++            )
++            if not need_bf16_dispatch:
++                use_fp8 = True
+ 
+         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+         # to return int32-packed UE8M0 scales that don't feed the flashinfer
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+index f276fca11f..6eff5999f8 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -182,8 +182,9 @@ class CompressedTensorsConfig(QuantizationConfig):
+                 use_flashinfer_trtllm_moe = (
+                     get_moe_runner_backend().is_flashinfer_trtllm()
+                 )
++                use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+                 return UnquantizedFusedMoEMethod(
+-                    use_triton_kernels, use_flashinfer_trtllm_moe
++                    use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
+                 )
+             return CompressedTensorsFusedMoEMethod(self)
+         return None
+diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
+index a3a3811715..e6247fce92 100644
+--- a/python/sglang/srt/layers/quantization/unquant.py
++++ b/python/sglang/srt/layers/quantization/unquant.py
+@@ -9,6 +9,7 @@ import torch
+ import torch.nn.functional as F
+ from torch.nn.parameter import Parameter
+ 
++from sglang.srt.environ import envs
+ from sglang.srt.layers.amx_utils import (
+     CPUQuantMethod,
+     _amx_process_weight_after_loading,
+@@ -163,13 +164,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+     """MoE method without quantization."""
+ 
+     def __init__(
+-        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
++        self,
++        use_triton_kernels: bool = False,
++        use_flashinfer_trtllm_moe: bool = False,
++        use_deep_gemm: bool = False,
+     ):
+         super().__init__()
+         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
+         self.use_triton_kernels = use_triton_kernels
+         self.with_bias = False
+         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
++        self.use_deep_gemm = use_deep_gemm
+         self._cache_permute_indices = dict({})
+ 
+     def create_weights(
+@@ -375,6 +380,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                 else MoeRunnerBackend.FLASHINFER_TRTLLM
+             )
++        elif self.use_deep_gemm:
++            backend = MoeRunnerBackend.DEEP_GEMM
+         elif self.use_triton_kernels:
+             backend = MoeRunnerBackend.TRITON_KERNELS
+         else:
+@@ -416,7 +423,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+ 
+         x = dispatch_output.hidden_states
+-        topk_output = dispatch_output.topk_output
+ 
+         moe_runner_config = self.moe_runner_config
+ 
+@@ -433,7 +439,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+                 w2_bias=getattr(layer, "w2_weight_bias", None),
+             )
+             return self.runner.run(dispatch_output, quant_info)
++        elif self.runner.runner_backend.is_deep_gemm():
++            w13_weight = layer.w13_weight
++            w2_weight = layer.w2_weight
++            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
++
++            # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
++            # otherwise use_fp8=True for FP8 dispatch path
++            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
++            quant_info = DeepGemmMoeQuantInfo(
++                w13_weight=w13_weight,
++                w2_weight=w2_weight,
++                use_fp8=use_fp8,
++            )
++            return self.runner.run(dispatch_output, quant_info)
+         elif self.use_flashinfer_cutlass:
++            topk_output = dispatch_output.topk_output
+             output = flashinfer_cutlass_fused_moe(
+                 input=x,
+                 token_selected_experts=topk_output.topk_ids,
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 0391dd2f02..afec6de733 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -2060,6 +2060,11 @@ class ServerArgs:
+                     logger.warning(
+                         "Detected ROCm with SGLANG_USE_AITER for GPT-OSS bf16 model, using triton MOE kernel."
+                     )
++                elif is_musa() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
++                    self.moe_runner_backend = "deep_gemm"
++                    logger.warning(
++                        "Detected MUSA with SGLANG_DEEPEP_BF16_DISPATCH for bf16 model, using deep_gemm kernel."
++                    )
+                 elif (
+                     self.ep_size == 1
+                     and is_triton_kernels_available()

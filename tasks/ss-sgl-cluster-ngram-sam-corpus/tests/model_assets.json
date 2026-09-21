@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "source": {
+    "kind": "authentic_public_checkpoint",
+    "repository": "Qwen/Qwen2.5-Coder-7B-Instruct",
+    "revision": "c03e6d358207e414f1eca0bb1891e29f1db0e242",
+    "license": "Apache-2.0",
+    "config_model_type": "qwen2",
+    "config_architecture": "Qwen2ForCausalLM",
+    "index_file": "model.safetensors.index.json",
+    "index_size_bytes": 27752,
+    "index_sha256": "998a078123ffc97763690de7f2a677eb89168af5eaf8a5e12e6bc24d18e25bdb",
+    "weight_tensor_total_bytes": 15231233024,
+    "weight_file_total_bytes": 15231271864,
+    "weight_shard_count": 4,
+    "weight_manifest_sha256": "5696956ecb8cedfe017f16bb9ad0e9023fc9b56727cd0152f9846fee0d9fcf09",
+    "config_files": {
+      "config.json": {"sha256": "c0242402ad6a13b331ea320feea8c7e3776ffb7a4eff0757b9cd667e116d9a28", "size": 663},
+      "generation_config.json": {"sha256": "1a628a5775bc69cde01c6749a531150ca4d3189652c618a174f7077923acf3b1", "size": 242},
+      "tokenizer.json": {"sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539", "size": 7031645},
+      "tokenizer_config.json": {"sha256": "959e7f1d9a1b7641a6d6ce05ca97b75c7894fcb66cbe5a040406458fb1128ee4", "size": 7305},
+      "vocab.json": {"sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910", "size": 2776833},
+      "merges.txt": {"sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3", "size": 1671839}
+    },
+    "served_by": "the e2e node (TestNgramSpeculativeDecodingFlashinfer) launches this checkpoint on one H100; the unit/server-arg nodes are CPU and do not load weights"
+  }
+}

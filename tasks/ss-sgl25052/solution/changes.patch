@@ -1,0 +1,129 @@
+diff --git a/python/pyproject.toml b/python/pyproject.toml
+index beacace1c..c1a902d7a 100755
+--- a/python/pyproject.toml
++++ b/python/pyproject.toml
+@@ -59,7 +59,7 @@ dependencies = [
+   "sentencepiece",
+   "setproctitle",
+   "flash-attn-4>=4.0.0b9",
+-  "sgl-deep-gemm==0.0.1",
++  "sgl-deep-gemm==0.1.0",
+   "sglang-kernel==0.4.2.post1",
+   "soundfile==0.13.1",
+   "tiktoken",
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index efd182b12..a115ac926 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -595,6 +595,17 @@ class Envs:
+     # DeepGemm Mega MoE
+     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
++
++    # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
++    # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
++    # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
++    # sizing + fp8_fp4_mega_moe pick up the FP4 layout.
++    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS = EnvBool(False)
++    # Switches the L1+L2 mainloops from kind::mxf8f6f4 (K=32 with-padding) to
++    # kind::mxf4 (K=64 dense) inside fp8_fp4_mega_moe. No effect unless
++    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
++    # this combination on the host side.
++    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+ 
+     # TopK
+diff --git a/python/sglang/srt/layers/moe/mega_moe.py b/python/sglang/srt/layers/moe/mega_moe.py
+index f94930b8a..93f4d9a15 100644
+--- a/python/sglang/srt/layers/moe/mega_moe.py
++++ b/python/sglang/srt/layers/moe/mega_moe.py
+@@ -15,6 +15,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from contextlib import nullcontext
+ from typing import TYPE_CHECKING, Optional
+ 
+@@ -34,6 +35,26 @@ if TYPE_CHECKING:
+ 
+ 
+ _MEGA_MOE_SYMM_BUFFER: dict = {}
++_MEGA_MOE_DG_ENV_APPLIED = False
++
++
++def _apply_mega_moe_dg_env() -> None:
++    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
++
++    DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
++    call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
++    Forwarding once at first use is sufficient (these are static config
++    flags, not per-request state) and matches the `setdefault` pattern so
++    explicit `DG_USE_*` overrides from outside still win.
++    """
++    global _MEGA_MOE_DG_ENV_APPLIED
++    if _MEGA_MOE_DG_ENV_APPLIED:
++        return
++    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
++        os.environ.setdefault("DG_USE_FP4_ACTS", "1")
++    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
++        os.environ.setdefault("DG_USE_MXF4_KIND", "1")
++    _MEGA_MOE_DG_ENV_APPLIED = True
+ 
+ 
+ def _get_mega_moe_symm_buffer(
+@@ -46,6 +67,8 @@ def _get_mega_moe_symm_buffer(
+ ) -> SymmBuffer:
+     import deep_gemm
+ 
++    _apply_mega_moe_dg_env()
++
+     key = (
+         id(group),
+         num_max_tokens_per_rank,
+@@ -188,16 +211,35 @@ def _run_mega_routed(
+     else:
+         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+-    mega_moe_pre_dispatch(
+-        hidden_states,
+-        topk_ids_in,
+-        topk_weights_in,
+-        buf.x,
+-        buf.x_sf,
+-        buf.topk_idx,
+-        buf.topk_weights,
+-        quant_group_size=32,
+-    )
++
++    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
++    if use_fp4_acts:
++        # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
++        # handles the E2M1 packing variant. The jit implementation
++        # only emits FP8.
++        deep_gemm.mega_moe_pre_dispatch(
++            hidden_states,
++            topk_ids_in,
++            topk_weights_in,
++            buf.x,
++            buf.x_sf,
++            buf.topk_idx,
++            buf.topk_weights,
++            num_tokens=num_tokens,
++            group_size=32,
++            use_fp4_acts=True,
++        )
++    else:
++        mega_moe_pre_dispatch(
++            hidden_states,
++            topk_ids_in,
++            topk_weights_in,
++            buf.x,
++            buf.x_sf,
++            buf.topk_idx,
++            buf.topk_weights,
++            quant_group_size=32,
++        )
+ 
+     # Allocate at least one row so y has a non-null CUDA data_ptr;
+     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().

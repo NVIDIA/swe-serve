@@ -1,0 +1,679 @@
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 6d2960303..1694e651c 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -240,6 +240,7 @@ class Envs:
+     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
+     IS_H200 = EnvBool(False)
+     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
++    SGLANG_ENABLE_CP_V2 = EnvBool(False)
+     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
+     SGLANG_PROFILE_V2 = EnvBool(False)
+diff --git a/python/sglang/srt/layers/cp/__init__.py b/python/sglang/srt/layers/cp/__init__.py
+new file mode 100644
+index 000000000..bfa252920
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/__init__.py
+@@ -0,0 +1,55 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Context parallel strategy abstractions."""
++
++from sglang.srt.layers.cp.base import (
++    BaseContextParallelMetadata,
++    ContextParallelStrategy,
++    ContextParallelStrategyKind,
++    CPAttentionBackendKind,
++    get_cp_strategy,
++    get_cp_strategy_kind,
++    init_cp_strategy,
++    is_cp_enabled,
++    is_interleave,
++    is_zigzag,
++)
++from sglang.srt.layers.cp.interleave import (
++    InterleaveContextParallelMetadata,
++    InterleaveCPStrategy,
++)
++from sglang.srt.layers.cp.zigzag import (
++    ContextParallelMetadata,
++    ZigzagContextParallelMetadata,
++    ZigzagCPStrategy,
++)
++
++__all__ = [
++    "BaseContextParallelMetadata",
++    "CPAttentionBackendKind",
++    "ContextParallelMetadata",
++    "ContextParallelStrategy",
++    "ContextParallelStrategyKind",
++    "InterleaveCPStrategy",
++    "InterleaveContextParallelMetadata",
++    "ZigzagCPStrategy",
++    "ZigzagContextParallelMetadata",
++    "get_cp_strategy",
++    "get_cp_strategy_kind",
++    "init_cp_strategy",
++    "is_cp_enabled",
++    "is_interleave",
++    "is_zigzag",
++]
+diff --git a/python/sglang/srt/layers/cp/base.py b/python/sglang/srt/layers/cp/base.py
+new file mode 100644
+index 000000000..57a7dcd15
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/base.py
+@@ -0,0 +1,280 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Base types and process-wide helpers for context parallel strategies.
++
++The strategy implementation is split across:
++
++* ``base.py``: base ABC, base metadata dataclass, enums, and singleton helpers.
++* ``zigzag.py``: former in-seq-split strategy and zigzag metadata.
++* ``interleave.py``: former round-robin-split strategy and interleave metadata.
++* ``utils.py``: public re-exports for import convenience.
++"""
++
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from dataclasses import dataclass
++from enum import IntEnum
++from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++    from sglang.srt.server_args import ServerArgs
++
++
++class ContextParallelStrategyKind(IntEnum):
++    """Context parallel strategy identifiers."""
++
++    NONE = 0
++    ZIGZAG = 1
++    INTERLEAVE = 2
++
++    @classmethod
++    def from_string(cls, value: str) -> ContextParallelStrategyKind:
++        if value == "zigzag":
++            return cls.ZIGZAG
++        if value == "interleave":
++            return cls.INTERLEAVE
++        raise ValueError(
++            f"Unknown cp_strategy={value!r}; expected one of "
++            "{'zigzag', 'interleave'}"
++        )
++
++    @property
++    def cli_value(self) -> str:
++        return {
++            ContextParallelStrategyKind.NONE: "none",
++            ContextParallelStrategyKind.ZIGZAG: "zigzag",
++            ContextParallelStrategyKind.INTERLEAVE: "interleave",
++        }[self]
++
++
++class CPAttentionBackendKind(IntEnum):
++    """Attention backend calling convention used by CP strategy dispatch."""
++
++    FLASH_ATTENTION = 0
++
++    @classmethod
++    def from_string(cls, value: str) -> CPAttentionBackendKind:
++        if value in ("fa3", "flashinfer"):
++            return cls.FLASH_ATTENTION
++        raise ValueError(
++            f"Unsupported attention_backend={value!r} for CP strategy; expected one "
++            "of {'fa3', 'flashinfer'}"
++        )
++
++
++@dataclass
++class BaseContextParallelMetadata:
++    total_seq_lens: int = 0
++    bs: int = 1
++
++
++class ContextParallelStrategy(ABC):
++    """Owns process-wide policy for one context parallel layout."""
++
++    name: str
++    kind: ContextParallelStrategyKind
++
++    def __init__(self, cp_size: int):
++        self.cp_size = cp_size
++
++    @property
++    def cp_rank(self) -> int:
++        from sglang.srt.layers.dp_attention import get_attention_cp_rank
++
++        return get_attention_cp_rank()
++
++    @property
++    def per_layer_attn_cp_comm(self) -> bool:
++        return _is_dsa_active()
++
++    @abstractmethod
++    def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
++        """Return True if this strategy can shard the current forward."""
++
++    @abstractmethod
++    def build_metadata(
++        self,
++        num_tokens: int,
++        seqs_len: Optional[List[int]],
++        extend_seqs_len: Optional[List[int]] = None,
++    ) -> BaseContextParallelMetadata:
++        """Build per-forward metadata for this strategy."""
++
++    @abstractmethod
++    def shard_hidden_states(self, x: Any, forward_batch: ForwardBatch) -> Any:
++        """Shard hidden states to the current CP rank, usually at the first layer."""
++
++    @abstractmethod
++    def shard_position_ids(self, positions: Any, forward_batch: ForwardBatch) -> Any:
++        """Shard KV-cache slot position IDs for each token to the current CP rank."""
++
++    @abstractmethod
++    def gather_hidden_states(
++        self,
++        x: Any,
++        forward_batch: ForwardBatch,
++        stream: Optional[Any] = None,
++    ) -> Any:
++        """Gather rank-local hidden states, usually at the last layer."""
++
++    @abstractmethod
++    def gather_kv_cache(
++        self,
++        x: Any,
++        forward_batch: ForwardBatch,
++        stream: Optional[Any] = None,
++    ) -> Any:
++        """Gather rank-local KV payloads back to full token order."""
++
++    def shard_per_request(
++        self,
++        extend_seqs_cpu: List[int],
++        extend_seqs: Any,
++    ) -> Tuple[List[int], Any, List[int], Any]:
++        raise NotImplementedError(
++            f"{self.name} strategy does not support per-request sharding"
++        )
++
++    def split_before_forward(
++        self,
++        forward_batch: ForwardBatch,
++        input_ids: Optional[Any],
++        positions: Any,
++        input_embeds: Optional[Any] = None,
++    ) -> Optional[Any]:
++        """Shard model inputs before model.forward in CP-v2 paths."""
++        if input_ids is not None:
++            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
++                input_ids, forward_batch
++            )
++        forward_batch.positions = self.shard_position_ids(positions, forward_batch)
++        if input_embeds is not None:
++            return self.shard_hidden_states(input_embeds, forward_batch)
++        return None
++
++    @abstractmethod
++    def run_attention(
++        self,
++        q: Any,
++        forward_batch: ForwardBatch,
++        device: Any,
++        attn_fn: Callable[[Any, Any, Any, int], Any],
++        attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
++    ) -> Any:
++        """Dispatch CP attention using the selected backend convention."""
++
++    @abstractmethod
++    def materialize_full_kv(
++        self,
++        forward_batch: ForwardBatch,
++        layer: Any,
++        k: Any,
++        v: Any,
++    ) -> None:
++        """Write full-layout K/V to the backend cache if needed."""
++
++    def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
++        """Optional attention metadata rewrite for strategies that need it."""
++        return None
++
++
++def _is_dsa_active() -> bool:
++    from sglang.srt.server_args import get_global_server_args
++
++    sa = get_global_server_args()
++    return bool(
++        getattr(sa, "enable_prefill_cp", False)
++        and getattr(sa, "_is_dsa_model_arch", False)
++    )
++
++
++_STRATEGY: Optional[ContextParallelStrategy] = None
++
++
++def init_cp_strategy(server_args: ServerArgs) -> None:
++    """Bind the configured CP strategy for this process."""
++    global _STRATEGY
++
++    if not getattr(server_args, "enable_prefill_cp", False):
++        _STRATEGY = None
++        return
++
++    cp_size = getattr(server_args, "attn_cp_size", 1)
++    if cp_size <= 1:
++        _STRATEGY = None
++        return
++
++    kind = ContextParallelStrategyKind.from_string(server_args.cp_strategy)
++    if kind == ContextParallelStrategyKind.ZIGZAG:
++        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
++
++        _STRATEGY = ZigzagCPStrategy(cp_size=cp_size)
++    elif kind == ContextParallelStrategyKind.INTERLEAVE:
++        from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
++
++        _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
++    else:
++        raise ValueError(
++            f"Unsupported cp_strategy kind {kind} for "
++            f"cp_strategy={server_args.cp_strategy!r}"
++        )
++
++
++def _get_cp_strategy() -> Optional[ContextParallelStrategy]:
++    """Return the configured strategy, initializing lazily on first call.
++
++    Subprocesses re-import this module with ``_STRATEGY = None`` and never
++    re-run ``ServerArgs.__post_init__`` because the pickled instance bypasses
++    ``__init__``. Lazy init lets worker processes recover the singleton from
++    global server args.
++    """
++    global _STRATEGY
++
++    if _STRATEGY is None:
++        from sglang.srt.server_args import get_global_server_args
++
++        try:
++            server_args = get_global_server_args()
++        except ValueError:
++            return None
++        if server_args is not None and getattr(server_args, "enable_prefill_cp", False):
++            init_cp_strategy(server_args)
++    return _STRATEGY
++
++
++def get_cp_strategy() -> Optional[ContextParallelStrategy]:
++    """Return the configured CP strategy for runtime dispatch."""
++    return _get_cp_strategy()
++
++
++def get_cp_strategy_kind() -> ContextParallelStrategyKind:
++    strategy = _get_cp_strategy()
++    if strategy is None:
++        return ContextParallelStrategyKind.NONE
++    return strategy.kind
++
++
++def is_cp_enabled() -> bool:
++    return _get_cp_strategy() is not None
++
++
++def is_zigzag() -> bool:
++    return get_cp_strategy_kind() == ContextParallelStrategyKind.ZIGZAG
++
++
++def is_interleave() -> bool:
++    return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
+diff --git a/python/sglang/srt/layers/cp/interleave.py b/python/sglang/srt/layers/cp/interleave.py
+new file mode 100644
+index 000000000..7ce9db896
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/interleave.py
+@@ -0,0 +1,105 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Interleave context parallel strategy shell.
++
++For ``cp_size = 4``, each rank owns every fourth token:
++
++    dp_attn_tp0: token0, token4, token8,  token12, token16, ...
++    dp_attn_tp1: token1, token5, token9,  token13, token17, ...
++    dp_attn_tp2: token2, token6, token10, token14, token18, ...
++    dp_attn_tp3: token3, token7, token11, token15, token19, ...
++
++After all-gather, tokens are restored to the original order:
++
++    token0, token1, token2, token3, token4, token5, token6, token7, ...
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, List, Optional
++
++from sglang.srt.layers.cp.base import (
++    BaseContextParallelMetadata,
++    ContextParallelStrategy,
++    ContextParallelStrategyKind,
++    CPAttentionBackendKind,
++)
++
++
++@dataclass
++class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
++    """Interleave has no per-forward zigzag permutation payload."""
++
++
++class InterleaveCPStrategy(ContextParallelStrategy):
++    name = "interleave"
++    kind = ContextParallelStrategyKind.INTERLEAVE
++
++    def can_apply(self, num_tokens: int, forward_batch) -> bool:
++        if self.cp_size <= 1 or num_tokens < self.cp_size:
++            return False
++        forward_mode = getattr(forward_batch, "forward_mode", None)
++        return forward_mode is None or forward_mode.is_context_parallel_extend()
++
++    def build_metadata(
++        self,
++        num_tokens: int,
++        seqs_len: Optional[List[int]],
++        extend_seqs_len: Optional[List[int]] = None,
++    ) -> InterleaveContextParallelMetadata:
++        return InterleaveContextParallelMetadata(
++            total_seq_lens=sum(extend_seqs_len or seqs_len or [num_tokens]),
++            bs=len(extend_seqs_len or seqs_len or [num_tokens]),
++        )
++
++    def shard_hidden_states(self, x: Any, forward_batch) -> Any:
++        raise NotImplementedError(
++            "Interleave hidden-state sharding will land in a follow-up PR"
++        )
++
++    def shard_position_ids(self, positions: Any, forward_batch) -> Any:
++        raise NotImplementedError(
++            "Interleave position-id sharding will land in a follow-up PR"
++        )
++
++    def gather_hidden_states(
++        self, x: Any, forward_batch, stream: Optional[Any] = None
++    ) -> Any:
++        raise NotImplementedError(
++            "Interleave hidden-state gather will land in a follow-up PR"
++        )
++
++    def gather_kv_cache(
++        self, x: Any, forward_batch, stream: Optional[Any] = None
++    ) -> Any:
++        raise NotImplementedError("Interleave KV gather will land in a follow-up PR")
++
++    def run_attention(
++        self,
++        q: Any,
++        forward_batch,
++        device: Any,
++        attn_fn,
++        attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
++    ) -> Any:
++        raise NotImplementedError(
++            "Interleave attention dispatch will land in a follow-up PR"
++        )
++
++    def materialize_full_kv(self, forward_batch, layer: Any, k: Any, v: Any) -> None:
++        raise NotImplementedError(
++            "Interleave KV materialization will land in a follow-up PR"
++        )
+diff --git a/python/sglang/srt/layers/cp/utils.py b/python/sglang/srt/layers/cp/utils.py
+new file mode 100644
+index 000000000..a8a8582db
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/utils.py
+@@ -0,0 +1,43 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Public import facade for context parallel strategy helpers."""
++
++from sglang.srt.layers.cp.base import (
++    BaseContextParallelMetadata,
++    ContextParallelStrategy,
++    ContextParallelStrategyKind,
++    CPAttentionBackendKind,
++)
++from sglang.srt.layers.cp.interleave import (
++    InterleaveContextParallelMetadata,
++    InterleaveCPStrategy,
++)
++from sglang.srt.layers.cp.zigzag import (
++    ContextParallelMetadata,
++    ZigzagContextParallelMetadata,
++    ZigzagCPStrategy,
++)
++
++__all__ = [
++    "BaseContextParallelMetadata",
++    "CPAttentionBackendKind",
++    "ContextParallelMetadata",
++    "ContextParallelStrategy",
++    "ContextParallelStrategyKind",
++    "InterleaveCPStrategy",
++    "InterleaveContextParallelMetadata",
++    "ZigzagCPStrategy",
++    "ZigzagContextParallelMetadata",
++]
+diff --git a/python/sglang/srt/layers/cp/zigzag.py b/python/sglang/srt/layers/cp/zigzag.py
+new file mode 100644
+index 000000000..c25a75898
+--- /dev/null
++++ b/python/sglang/srt/layers/cp/zigzag.py
+@@ -0,0 +1,138 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++
++"""Zigzag context parallel strategy shell.
++
++For ``cp_size = 4``, each sequence is split into ``2 * cp_size`` blocks. Each
++rank owns one early block and one late block:
++
++    dp_attn_tp0: block0, block7
++    dp_attn_tp1: block1, block6
++    dp_attn_tp2: block2, block5
++    dp_attn_tp3: block3, block4
++
++After all-gather, the blocks are reranged back to their original order:
++
++    block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4
++      -> block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, List, Optional
++
++from sglang.srt.layers.cp.base import (
++    BaseContextParallelMetadata,
++    ContextParallelStrategy,
++    ContextParallelStrategyKind,
++    CPAttentionBackendKind,
++)
++
++
++@dataclass
++class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
++    # Layout lists have length bs * cp_segment_num (= bs * 2 * cp_size).
++    split_list: Optional[List[int]] = None
++    zigzag_index: Optional[List[int]] = None
++    cp_reverse_index: Optional[List[int]] = None
++    reverse_split_len: Optional[List[int]] = None
++
++    # Per-rank aggregate lists have length cp_size.
++    per_rank_actual_token: Optional[List[int]] = None
++    max_rank_len: Optional[List[int]] = None
++
++    # Per-sequence FlashAttention tensors (shape [bs] or [bs + 1]).
++    kv_len_prev_tensor: Optional[Any] = None
++    kv_len_next_tensor: Optional[Any] = None
++    actual_seq_q_prev_tensor: Optional[Any] = None
++    actual_seq_q_next_tensor: Optional[Any] = None
++    cu_seqlens_q_prev_tensor: Optional[Any] = None
++    cu_seqlens_q_next_tensor: Optional[Any] = None
++
++    # Scalars derived from the per-sequence lists above.
++    total_q_prev_tokens: int = 0
++    total_q_next_tokens: int = 0
++    max_seqlen_q_prev: int = 0
++    max_seqlen_q_next: int = 0
++
++    # Per-sequence CPU lists, useful for indexers and diagnostics.
++    kv_len_prev_list: Optional[List[int]] = None
++    kv_len_next_list: Optional[List[int]] = None
++    actual_seq_q_prev_list: Optional[List[int]] = None
++    actual_seq_q_next_list: Optional[List[int]] = None
++
++
++ContextParallelMetadata = ZigzagContextParallelMetadata
++
++
++class ZigzagCPStrategy(ContextParallelStrategy):
++    name = "zigzag"
++    kind = ContextParallelStrategyKind.ZIGZAG
++
++    def can_apply(self, num_tokens: int, forward_batch) -> bool:
++        if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
++            return False
++        forward_mode = getattr(forward_batch, "forward_mode", None)
++        return forward_mode is None or forward_mode.is_context_parallel_extend()
++
++    def build_metadata(
++        self,
++        num_tokens: int,
++        seqs_len: Optional[List[int]],
++        extend_seqs_len: Optional[List[int]] = None,
++    ) -> ZigzagContextParallelMetadata:
++        return ZigzagContextParallelMetadata(
++            total_seq_lens=sum(extend_seqs_len or seqs_len or [num_tokens]),
++            bs=len(extend_seqs_len or seqs_len or [num_tokens]),
++        )
++
++    def shard_hidden_states(self, x: Any, forward_batch) -> Any:
++        raise NotImplementedError(
++            "Zigzag hidden-state sharding will land in a follow-up PR"
++        )
++
++    def shard_position_ids(self, positions: Any, forward_batch) -> Any:
++        raise NotImplementedError(
++            "Zigzag position-id sharding will land in a follow-up PR"
++        )
++
++    def gather_hidden_states(
++        self, x: Any, forward_batch, stream: Optional[Any] = None
++    ) -> Any:
++        raise NotImplementedError(
++            "Zigzag hidden-state gather will land in a follow-up PR"
++        )
++
++    def gather_kv_cache(
++        self, x: Any, forward_batch, stream: Optional[Any] = None
++    ) -> Any:
++        raise NotImplementedError("Zigzag KV gather will land in a follow-up PR")
++
++    def run_attention(
++        self,
++        q: Any,
++        forward_batch,
++        device: Any,
++        attn_fn,
++        attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
++    ) -> Any:
++        raise NotImplementedError(
++            "Zigzag attention dispatch will land in a follow-up PR"
++        )
++
++    def materialize_full_kv(self, forward_batch, layer: Any, k: Any, v: Any) -> None:
++        raise NotImplementedError(
++            "Zigzag KV materialization will land in a follow-up PR"
++        )
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 7a1e2b02c..28cc109de 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -3535,6 +3535,10 @@ class ServerArgs:
+                 self.moe_dp_size == 1
+             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+ 
++        from sglang.srt.layers.cp.base import init_cp_strategy
++
++        init_cp_strategy(self)
++
+     def _handle_data_parallelism(self):
+         if self.dp_size == 1:
+             self.enable_dp_attention = False
+

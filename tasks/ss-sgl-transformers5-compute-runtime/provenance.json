@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl-transformers5-compute-runtime",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/22931"
+  ]
+}

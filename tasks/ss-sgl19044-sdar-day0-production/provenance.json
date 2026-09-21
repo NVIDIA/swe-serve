@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl19044-sdar-day0-production",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/19044"
+  ]
+}

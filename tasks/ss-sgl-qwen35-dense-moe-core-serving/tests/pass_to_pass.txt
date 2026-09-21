@@ -1,0 +1,1 @@
+test/registered/unit/models/test_qwen3_5_registry.py::test_qwen3_next_causal_model_remains_discoverable

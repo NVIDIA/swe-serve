@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "upstream_model_identifier": "meta-llama/Llama-3.1-8B-Instruct",
+  "verifier_snapshot": {
+    "repository": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+    "revision": "d10aef7999a2b5ba950ab3974312feeedbfe0b77",
+    "parameter_count": 8030261248,
+    "weight_bytes": 16060556376,
+    "weight_shards": {
+      "model-00001-of-00004.safetensors": "2b1879f356aed350030bb40eb45ad362c89d9891096f79a3ab323d3ba5607668",
+      "model-00002-of-00004.safetensors": "09d433f650646834a83c580877bd60c6d1f88f7755305c12576b5c7058f9af15",
+      "model-00003-of-00004.safetensors": "fc1cdddd6bfa91128d6e94ee73d0ce62bfcdb7af29e978ddcab30c66ae9ea7fa",
+      "model-00004-of-00004.safetensors": "92ecfe1a2414458b4821ac8c13cf8cb70aed66b5eea8dc5ad9eeb4ff309d6d7b"
+    }
+  },
+  "equivalence_scope": "The public mirror is the packet's content-pinned distribution of the same Meta-Llama-3.1-8B-Instruct architecture and tokenizer expected by the upstream test.",
+  "runtime_evidence": "The existing verifier compares raw greedy completion token IDs against target-only serving from this exact snapshot in every DFLASH launch mode.",
+  "repository_identity_note": "Repository names differ; verifier provenance records the substitution explicitly instead of treating the floating upstream identifier as a separate downloadable asset."
+}

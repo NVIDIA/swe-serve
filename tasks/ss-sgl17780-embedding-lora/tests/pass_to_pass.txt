@@ -1,0 +1,1 @@
+test/registered/lora/test_embedding_lora_support.py::TestEmbeddingBaseServing::test_embedding_base_no_lora

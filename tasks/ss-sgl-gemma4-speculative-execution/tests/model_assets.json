@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "assets": {
+    "target": {
+      "kind": "authentic_public_checkpoint",
+      "repository": "google/gemma-4-31B-it",
+      "revision": "3548789868c5356dbf307c98e6f609007b82b3eb",
+      "license": "Apache-2.0",
+      "config_model_type": "gemma4",
+      "config_architecture": "Gemma4ForConditionalGeneration",
+      "weight_shards": [
+        {"file": "model-00001-of-00002.safetensors", "size_bytes": 49784788364, "sha256": "eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa"},
+        {"file": "model-00002-of-00002.safetensors", "size_bytes": 12761549884, "sha256": "018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10"}
+      ]
+    },
+    "draft": {
+      "kind": "authentic_public_checkpoint",
+      "repository": "z-lab/gemma-4-31B-it-DFlash",
+      "revision": "eabd648301ce28583cc14757912e5e0f84e152e1",
+      "license": "Apache-2.0",
+      "config_model_type": "qwen3",
+      "config_architecture": "DFlashDraftModel",
+      "weight_shards": [
+        {"file": "model.safetensors", "size_bytes": 3071941240, "sha256": "b3f28580103d6e8a0a1d9389646957b9309df5982558afd754b9810357f425b7"}
+      ]
+    }
+  },
+  "common_assets": ["target", "draft"],
+  "profiles": {
+    "h100_1": {"gpu_family": "hopper", "gpu_name_contains": "H100", "allocation_gpus": 1, "tp_size": 1, "online_quantization": "fp8"},
+    "h100_4": {"gpu_family": "hopper", "gpu_name_contains": "H100", "allocation_gpus": 4, "tp_size": 4, "online_quantization": null},
+    "gb200_1_logical": {"gpu_family": "blackwell", "gpu_name_contains": "GB200", "allocation_gpus": 4, "tp_size": 1, "logical_gpus": 1, "online_quantization": null},
+    "gb200_4": {"gpu_family": "blackwell", "gpu_name_contains": "GB200", "allocation_gpus": 4, "tp_size": 4, "online_quantization": null},
+    "gb300_1": {"gpu_family": "blackwell", "gpu_name_contains": "GB300", "allocation_gpus": 1, "tp_size": 1, "online_quantization": null}
+  }
+}

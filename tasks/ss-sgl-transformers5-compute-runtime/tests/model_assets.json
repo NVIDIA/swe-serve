@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "assets": {
+    "llama31_8b_instruct": {
+      "kind": "complete_authentic_public_checkpoint",
+      "repository": "NousResearch/Meta-Llama-3.1-8B-Instruct",
+      "revision": "d10aef7999a2b5ba950ab3974312feeedbfe0b77",
+      "license": "llama3.1",
+      "parameter_count": 8030261248,
+      "model_path_env": "TRANSFORMERS5_MODEL_PATH",
+      "config_model_type": "llama",
+      "config_architecture": "LlamaForCausalLM",
+      "snapshot_size_bytes": 16069773869,
+      "runtime_files": [
+        ".gitattributes",
+        "LICENSE",
+        "README.md",
+        "USE_POLICY.md",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors.index.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json"
+      ],
+      "weight_shards": [
+        {
+          "file": "model-00001-of-00004.safetensors",
+          "size_bytes": 4976698672,
+          "sha256": "2b1879f356aed350030bb40eb45ad362c89d9891096f79a3ab323d3ba5607668"
+        },
+        {
+          "file": "model-00002-of-00004.safetensors",
+          "size_bytes": 4999802720,
+          "sha256": "09d433f650646834a83c580877bd60c6d1f88f7755305c12576b5c7058f9af15"
+        },
+        {
+          "file": "model-00003-of-00004.safetensors",
+          "size_bytes": 4915916176,
+          "sha256": "fc1cdddd6bfa91128d6e94ee73d0ce62bfcdb7af29e978ddcab30c66ae9ea7fa"
+        },
+        {
+          "file": "model-00004-of-00004.safetensors",
+          "size_bytes": 1168138808,
+          "sha256": "92ecfe1a2414458b4821ac8c13cf8cb70aed66b5eea8dc5ad9eeb4ff309d6d7b"
+        }
+      ],
+      "excluded_paths": ["original/*"]
+    }
+  },
+  "common_assets": ["llama31_8b_instruct"],
+  "hardware_profiles": {
+    "h100_1": {"allocation_gpus": 1, "tp_size": 1, "pp_size": 1, "compute_capability": [9, 0]},
+    "h100_4": {"allocation_gpus": 4, "tp_size": 4, "pp_size": 1, "compute_capability": [9, 0]},
+    "gb200_1_logical": {"allocation_gpus": 4, "tp_size": 1, "pp_size": 1, "compute_capability": [10, 0]},
+    "gb200_4": {"allocation_gpus": 4, "tp_size": 4, "pp_size": 1, "compute_capability": [10, 0]},
+    "gb300_1": {"allocation_gpus": 1, "tp_size": 1, "pp_size": 1, "compute_capability": [10, 3]}
+  },
+  "variants": [
+    {
+      "name": "forced-transformers-int4wo-serving",
+      "asset": "llama31_8b_instruct",
+      "required": true,
+      "server_args": ["--model-impl", "transformers", "--torchao-config", "int4wo-128", "--attention-backend", "triton", "--sampling-backend", "pytorch"]
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+test/registered/sampling/test_penalty_isolated.py::TestRepetitionPenaltyIsolated::test_repetition_penalty_reduces_repetition
+test/registered/sampling/test_penalty_isolated.py::TestRepetitionPenaltyIsolated::test_repetition_penalty_reduces_repetition_native_generate

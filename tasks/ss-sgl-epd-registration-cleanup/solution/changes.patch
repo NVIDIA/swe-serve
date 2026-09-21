@@ -1,0 +1,123 @@
+diff --git a/python/sglang/srt/disaggregation/encode_receiver.py b/python/sglang/srt/disaggregation/encode_receiver.py
+index b83cd6dc0..2f43b7c50 100644
+--- a/python/sglang/srt/disaggregation/encode_receiver.py
++++ b/python/sglang/srt/disaggregation/encode_receiver.py
+@@ -153,9 +153,9 @@ class EncoderBootstrapServer:
+     def register(self, url: str) -> bool:
+         """Add *url* if not already present.  Returns True if added."""
+         with self._lock:
++            self._consecutive_failures.pop(url, None)
+             if url not in self._urls:
+                 self._urls.append(url)
+-                self._consecutive_failures.pop(url, None)
+                 logger.info(f"Registered encoder URL: {url}")
+                 return True
+             logger.debug(f"Encoder URL already registered: {url}")
+@@ -166,6 +166,7 @@ class EncoderBootstrapServer:
+         with self._lock:
+             if url in self._urls:
+                 self._urls.remove(url)
++                self._consecutive_failures.pop(url, None)
+                 logger.info(f"Unregistered encoder URL: {url}")
+                 return True
+             return False
+diff --git a/python/sglang/srt/disaggregation/encode_server.py b/python/sglang/srt/disaggregation/encode_server.py
+index 9e3435f0d..5687847c2 100644
+--- a/python/sglang/srt/disaggregation/encode_server.py
++++ b/python/sglang/srt/disaggregation/encode_server.py
+@@ -3129,7 +3129,17 @@ def launch_encoder(server_args, schedule_path, dist_init_method, rank):
+         traceback.print_exc()
+
+
+-def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
++def _encoder_url_from_server_args(server_args: ServerArgs) -> str:
++    host = server_args.host
++    if not host or host in ("0.0.0.0", "::"):
++        host = get_local_ip_auto(server_args.host)
++    scheme = "https" if server_args.ssl_certfile else "http"
++    return NetworkAddress(host, server_args.port).to_url(scheme)
++
++
++def _register_encoder_url_with_bootstrap(
++    server_args: ServerArgs,
++) -> Optional[Tuple[str, Tuple[str, ...]]]:
+     """Asynchronously register this encoder with each bootstrap URL.
+
+     Spawns a daemon thread that retries each URL independently with bounded
+@@ -3141,11 +3151,12 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
+     instead of serialising sleeps in a single thread.
+     """
+ 
+-    encoder_url = server_args.url()
+-    payload = {"url": encoder_url}
+-    bootstrap_urls = list(server_args.encoder_register_urls)
++    bootstrap_urls = tuple(server_args.encoder_register_urls)
+     if not bootstrap_urls:
+-        return
++        return None
++
++    encoder_url = _encoder_url_from_server_args(server_args)
++    payload = {"url": encoder_url}
+ 
+     max_retries = 30
+     retry_interval = 5.0
+@@ -3195,6 +3206,33 @@ def _register_encoder_url_with_bootstrap(server_args: ServerArgs):
+     threading.Thread(
+         target=_worker, daemon=True, name="encoder-bootstrap-register"
+     ).start()
++    return encoder_url, bootstrap_urls
++
++
++def _unregister_encoder_url_from_bootstrap(
++    encoder_url: str, bootstrap_urls: Tuple[str, ...]
++):
++    payload = {"url": encoder_url}
++
++    for bootstrap_url in bootstrap_urls:
++        try:
++            resp = http_requests.delete(
++                f"{bootstrap_url}/unregister_encoder_url",
++                json=payload,
++                timeout=2.0,
++            )
++            if resp.status_code == 200:
++                logger.info(
++                    f"Unregistered encoder URL '{encoder_url}' from "
++                    f"bootstrap at {bootstrap_url}"
++                )
++            else:
++                logger.warning(
++                    f"Bootstrap {bootstrap_url} returned "
++                    f"{resp.status_code} on unregister: {resp.text}"
++                )
++        except Exception as e:
++            logger.debug(f"Unregister from {bootstrap_url} failed: {e}")
+
+
+ def launch_server(server_args: ServerArgs):
+@@ -3229,7 +3267,11 @@ def launch_server(server_args: ServerArgs):
+
+     # Register this encoder's URL with prefill server(s) if configured.
+     if server_args.encoder_register_urls:
+-        _register_encoder_url_with_bootstrap(server_args)
++        import atexit
++
++        registration = _register_encoder_url_with_bootstrap(server_args)
++        if registration is not None:
++            atexit.register(_unregister_encoder_url_from_bootstrap, *registration)
+ 
+     uvicorn.run(app, host=server_args.host, port=server_args.port)
+ 
+@@ -3305,7 +3347,11 @@ def _launch_server_dp(server_args: ServerArgs):
+ 
+     # Register this encoder's URL with prefill server(s) if configured.
+     if server_args.encoder_register_urls:
+-        _register_encoder_url_with_bootstrap(server_args)
++        import atexit
++
++        registration = _register_encoder_url_with_bootstrap(server_args)
++        if registration is not None:
++            atexit.register(_unregister_encoder_url_from_bootstrap, *registration)
+ 
+     uvicorn.run(app, host=server_args.host, port=server_args.port)
+ 

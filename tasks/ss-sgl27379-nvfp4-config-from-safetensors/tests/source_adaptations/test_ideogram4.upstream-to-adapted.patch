@@ -1,0 +1,160 @@
+diff --git a/python/sglang/multimodal_gen/test/unit/test_ideogram4.py b/python/sglang/multimodal_gen/test/unit/test_ideogram4.py
+index 12e103e10..c0f12fc0f 100644
+--- a/python/sglang/multimodal_gen/test/unit/test_ideogram4.py
++++ b/python/sglang/multimodal_gen/test/unit/test_ideogram4.py
+@@ -1,14 +1,13 @@
+ import json
+ import os
++import sys
+ import tempfile
+ import unittest
+-from types import SimpleNamespace
++from types import ModuleType, SimpleNamespace
+ from unittest.mock import patch
+ 
+ import torch
+ import torch.nn.functional as F
+-from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+-
+ from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+ from sglang.multimodal_gen.configs.models.encoders.ideogram import (
+     Ideogram4TextEncoderConfig,
+@@ -38,6 +37,9 @@
+     Qwen3VLTextRotaryEmbedding,
+     qwen3_apply_rotary_pos_emb,
+ )
++from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
++    TextEncoderLoader,
++)
+ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+     TransformerLoader,
+     _server_args_for_transformer_component,
+@@ -71,6 +73,7 @@
+ )
+ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+ from sglang.multimodal_gen.runtime.server_args import set_global_server_args
++from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+ 
+ 
+ def _reference_qwen3_mrope(position_ids, head_dim, rope_theta, mrope_section):
+@@ -743,17 +746,65 @@
+         self.assertEqual(model.weight_scale.dtype, torch.float32)
+ 
+     def test_ideogram_text_encoder_post_config_hook_preserves_local_arch(self):
++        class FakeTextEncoder(torch.nn.Module):
++            def __init__(self, _config):
++                super().__init__()
++                self.final_device = None
++
++            def load_weights(self, weights):
++                list(weights)
++                return set()
++
++            def to(self, device):
++                self.final_device = torch.device(device)
++                return self
++
+         config = Ideogram4TextEncoderConfig()
+-        config.arch_config.architectures = ["RemoteQwen3VLTextModel"]
+-        config.arch_config.ideogram_fp8_weight_only = False
+-        config.post_diffusers_config_update()
+-        self.assertEqual(
+-            config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
++        config.update_model_arch(
++            {
++                "quantization_config": {
++                    "quant_method": "bitsandbytes",
++                    "load_in_4bit": True,
++                    "bnb_4bit_quant_type": "nf4",
++                }
++            }
+         )
+-        self.assertTrue(config.arch_config.ideogram_fp8_weight_only)
+-        self.assertFalse(config.arch_config.ideogram_bnb_4bit_weight_only)
+-        self.assertFalse(config.arch_config.requires_gpu_resident_text_encoder)
++        server_args = SimpleNamespace(
++            text_encoder_cpu_offload=False,
++            pipeline_config=SimpleNamespace(),
++            pin_cpu_memory=False,
++        )
++        loader = TextEncoderLoader()
++
++        from sglang.multimodal_gen.runtime.loader.component_loaders import (
++            text_encoder_loader as loader_module,
++        )
++
++        local_device = torch.device("meta")
++        with (
++            patch.object(loader_module.current_platform, "is_cpu", return_value=False),
++            patch.object(loader_module.current_platform, "is_mps", return_value=False),
++            patch.object(
++                loader_module,
++                "get_local_torch_device",
++                return_value=local_device,
++            ),
++            patch.object(
++                loader_module.ModelRegistry,
++                "resolve_model_cls",
++                return_value=(FakeTextEncoder, None),
++            ),
++            patch.object(loader, "_get_all_weights", return_value=iter(())),
++        ):
++            model = loader.load_model(
++                "/unused/text_encoder",
++                config,
++                server_args,
++                cpu_offload_flag=True,
++            )
+ 
++        self.assertEqual(model.final_device, local_device)
++
+     def test_ideogram_text_encoder_post_config_hook_uses_bnb_for_nf4(self):
+         config = Ideogram4TextEncoderConfig()
+         config.update_model_arch(
+@@ -765,14 +816,39 @@
+                 }
+             }
+         )
+-
+-        self.assertEqual(
+-            config.arch_config.architectures, ["IdeogramQwen3VLTextEncoder"]
++        config.arch_config.text_config = Qwen3VLTextConfig(
++            vocab_size=32,
++            hidden_size=16,
++            intermediate_size=32,
++            num_hidden_layers=1,
++            num_attention_heads=2,
++            num_key_value_heads=2,
++            head_dim=8,
++            max_position_embeddings=64,
++            pad_token_id=0,
+         )
+-        self.assertTrue(config.arch_config.ideogram_bnb_4bit_weight_only)
+-        self.assertFalse(config.arch_config.ideogram_fp8_weight_only)
+-        self.assertTrue(config.arch_config.requires_gpu_resident_text_encoder)
+-
++
++        import sglang.multimodal_gen.runtime.server_args as server_args_module
++
++        bitsandbytes_stub = ModuleType("bitsandbytes")
++        bitsandbytes_stub.__version__ = "0.46.1"
++        prev_args = server_args_module._global_server_args
++        try:
++            set_global_server_args(
++                SimpleNamespace(attention_backend="torch_sdpa", comfyui_mode=False)
++            )
++            with (
++                patch.dict(sys.modules, {"bitsandbytes": bitsandbytes_stub}),
++                torch.device("meta"),
++            ):
++                encoder = IdeogramQwen3VLTextEncoder(config)
++        finally:
++            set_global_server_args(prev_args)
++
++        parameters = list(encoder.parameters())
++        self.assertTrue(any(param.dtype == torch.uint8 for param in parameters))
++        self.assertFalse(any(param.dtype == FP8_WEIGHT_DTYPE for param in parameters))
++
+     def test_ideogram_text_encoder_swaps_linears_to_weight_only_fp8(self):
+         config = Ideogram4TextEncoderConfig()
+         config.post_diffusers_config_update()

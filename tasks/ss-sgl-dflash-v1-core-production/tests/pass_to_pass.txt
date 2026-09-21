@@ -1,0 +1,2 @@
+test/registered/unit/spec/test_dflash_v1_regressions.py::test_zero_temperature_remains_greedy
+test/registered/unit/spec/test_dflash_v1_regressions.py::test_non_pd_load_balancing_remains_round_robin

@@ -1,0 +1,1 @@
+test/registered/unit/models/test_gemma3_registry_regression.py::test_gemma3_conditional_generation_remains_discoverable

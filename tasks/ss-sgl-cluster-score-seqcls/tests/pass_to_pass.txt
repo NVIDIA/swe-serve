@@ -1,0 +1,7 @@
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_batch_sizes
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_empty_items
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_without_softmax
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_varying_label_token_sets
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_unicode
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_deterministic
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_score_error_handling

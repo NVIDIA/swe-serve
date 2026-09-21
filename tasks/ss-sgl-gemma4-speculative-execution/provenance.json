@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl-gemma4-speculative-execution",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/27471"
+  ]
+}

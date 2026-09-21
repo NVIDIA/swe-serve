@@ -1,0 +1,2 @@
+[sglang.srt.plugins]
+event_order_probe = event_order_probe:activate

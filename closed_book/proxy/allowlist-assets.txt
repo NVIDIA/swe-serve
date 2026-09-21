@@ -1,0 +1,7 @@
+# Runtime model-asset hosts. Unlike allowlist-base.txt, these remain available
+# after the first model-gateway request. Every request is recorded in the
+# closed-book audit artifact without headers or query parameters.
+#
+# Hugging Face metadata, repositories, and LFS/CDN redirects.
+.huggingface.co
+.hf.co

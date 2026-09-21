@@ -1,0 +1,122 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 9bbe22e62..8419c9d17 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1062,6 +1062,22 @@ class Scheduler(
+             ]
+         )
+ 
++    def _check_forward_timeout_for_running_batch(self):
++        # NOTE: this should be called before a batch is launched,
++        # as current spec-v1 still filters batch inside verify stage.
++        timeout_ms = envs.SGLANG_FORWARD_TIMEOUT_MS.get()
++        if timeout_ms <= 0:
++            return
++        if self.running_batch.is_empty():
++            return
++
++        deadline = time.perf_counter() - timeout_ms / 1000.0
++        for req in self.running_batch.reqs:
++            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
++                req.to_finish = FINISH_ABORT(
++                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
++                )
++
+     @DynamicGradMode()
+     def event_loop_normal(self):
+         """A normal scheduler loop."""
+@@ -1823,6 +1839,7 @@ class Scheduler(
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+         self._abort_on_queued_timeout()
++        self._check_forward_timeout_for_running_batch()
+         if self.dllm_config is not None:
+             self.dllm_manager.filter_finished_reqs()
+ 
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index f284bf961..e321d401b 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -2,7 +2,6 @@ from __future__ import annotations
+ 
+ import logging
+ import time
+-from http import HTTPStatus
+ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+ 
+ import torch
+@@ -17,7 +16,6 @@ from sglang.srt.managers.io_struct import (
+     BatchTokenIDOutput,
+ )
+ from sglang.srt.managers.schedule_batch import (
+-    FINISH_ABORT,
+     BaseFinishReason,
+     Req,
+     RequestStage,
+@@ -163,19 +161,7 @@ class SchedulerOutputProcessorMixin:
+             # Check finish conditions
+             logprob_pt = 0
+ 
+-            deadline = -1
+-            if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+-                deadline = time.perf_counter() - timeout_ms / 1000.0
+-
+             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+-                if (
+-                    not req.finished()
+-                    and 0 < req.time_stats.forward_entry_time < deadline
+-                ):
+-                    req.to_finish = FINISH_ABORT(
+-                        "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+-                    )
+-
+                 if req.finished() or req.is_retracted:
+                     # decode req in mixed batch or retracted req
+                     continue
+@@ -458,20 +444,10 @@ class SchedulerOutputProcessorMixin:
+         # NOTE: in any case, we should check finish here
+         # if finished, also clean up committed kv cache and over-allocated kv cache here
+ 
+-        deadline = -1
+-        if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+-            deadline = time.perf_counter() - timeout_ms / 1000.0
+-
+         # Check finish condition
+         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+             req: Req
+ 
+-            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+-                # req.set_finish_with_abort()
+-                req.to_finish = FINISH_ABORT(
+-                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+-                )
+-
+             if self.enable_overlap and (req.finished() or req.is_retracted):
+                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
+                 # (currently not, e.g. Eagle V1 still check finish during forward)
+diff --git a/python/sglang/srt/speculative/multi_layer_eagle_worker.py b/python/sglang/srt/speculative/multi_layer_eagle_worker.py
+index de9b7a855..9369396a7 100644
+--- a/python/sglang/srt/speculative/multi_layer_eagle_worker.py
++++ b/python/sglang/srt/speculative/multi_layer_eagle_worker.py
+@@ -638,21 +638,6 @@ class MultiLayerEagleWorker(TpModelWorker):
+         assert forward_batch.spec_info is batch.spec_info
+         forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
+         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+-        has_finished, unfinished_req_index = False, []
+-        for i, req in enumerate(batch.reqs):
+-            if req.finished():
+-                has_finished = True
+-            else:
+-                unfinished_req_index.append(i)
+-        if has_finished:
+-            unfinished_index_device = torch.tensor(
+-                unfinished_req_index,
+-                dtype=torch.int64,
+-                device=batch.spec_info.topk_p.device,
+-            )
+-            batch.spec_info.filter_batch(
+-                unfinished_index_device, has_been_filtered=False
+-            )
+ 
+     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+         assert isinstance(batch.spec_info, EagleDraftInput)

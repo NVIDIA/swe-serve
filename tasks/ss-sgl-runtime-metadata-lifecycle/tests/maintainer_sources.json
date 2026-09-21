@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "source_repo": "https://github.com/sgl-project/sglang.git",
+  "source_revision": "441ae9a5ae0d7d7d1a22bde8cf329a2257181b2d",
+  "files": {
+    "test/registered/core/test_basic_sanity.py": "24d3d45dc3daea41b9d7f1487d3d0eb1b31d0e71b333cdf6e9b9f84a186dce31",
+    "test/registered/spec/dflash/test_dflash.py": "8e148565275ccf3c18b2cee9946622e5100d1123e4a3e7b33e4921fb8147dfe5",
+    "test/registered/spec/eagle/test_spec_eagle.py": "d25a67a50f93a7ff291907ae8d6e880f88e02c82a7c7ecce196cd03e9dae3241",
+    "test/registered/spec/eagle/test_spec_eagle_page.py": "a7641d29a00c247e561edb7f5bcd30fde14d1fc252e6f7394a3f69f87795f83d",
+    "test/registered/spec/eagle/test_spec_eagle_stress.py": "acd6acbe6cd48932a4ecd29495affe7702d9d1c4252c6042d82eb2b70e03aec7",
+    "test/registered/spec/eagle/test_spec_eagle_topk.py": "10015f2999ca0bece015c4b083d1204fb7d4606f120362d7feb1f1fe1f59d666",
+    "test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py": "f32bc5133a73fdbf89c43ed8cba6b4e3a30ddee98017f83e52c37649cf9077a7"
+  }
+}

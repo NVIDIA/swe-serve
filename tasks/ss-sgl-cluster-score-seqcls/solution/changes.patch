@@ -1,0 +1,1500 @@
+diff --git a/python/sglang/srt/batch_overlap/two_batch_overlap.py b/python/sglang/srt/batch_overlap/two_batch_overlap.py
+index 06027edce..4568e3410 100644
+--- a/python/sglang/srt/batch_overlap/two_batch_overlap.py
++++ b/python/sglang/srt/batch_overlap/two_batch_overlap.py
+@@ -702,6 +702,7 @@ class TboForwardBatchPreparer:
+             "mrope_positions",  # only used by qwen2-vl, thus not care
+             "split_index",  # for split prefill
+             "orig_seq_lens",  # only used by qwen-1m, thus not care
++            "return_pooled_hidden_states",
+         ]:
+             output_dict[key] = getattr(batch, key)
+         if not batch.forward_mode.is_target_verify():
+diff --git a/python/sglang/srt/configs/model_config.py b/python/sglang/srt/configs/model_config.py
+index 450ea6b12..5d5a8bcac 100644
+--- a/python/sglang/srt/configs/model_config.py
++++ b/python/sglang/srt/configs/model_config.py
+@@ -1428,6 +1428,17 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
+     )
+ 
+ 
++# SequenceClassification models that use CrossEncodingPooler
++_cross_encoding_pooler_archs = [
++    "BertForSequenceClassification",
++    "XLMRobertaForSequenceClassification",
++]
++
++
++def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
++    return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
++
++
+ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+     if scale <= 1:
+         return 1.0
+diff --git a/python/sglang/srt/entrypoints/engine_score_mixin.py b/python/sglang/srt/entrypoints/engine_score_mixin.py
+index aa9fa68f7..474e3925f 100644
+--- a/python/sglang/srt/entrypoints/engine_score_mixin.py
++++ b/python/sglang/srt/entrypoints/engine_score_mixin.py
+@@ -31,38 +31,35 @@ class EngineScoreMixin:
+         label_token_ids: Optional[List[int]] = None,
+         apply_softmax: bool = False,
+         item_first: bool = False,
++        return_pooled_hidden_states: bool = False,
+     ) -> ScoreResult:
+         """
+-        Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
+-        query = "<|user|>Is the following city the capital of France? "
+-        items = ["Paris <|assistant|>", "London <|assistant|>", "Berlin <|assistant|>"]
+-        label_token_ids = [2332, 1223] # Token IDs for "Yes" and "No"
+-        item_first = False
++        Score items against a query using the loaded model.
+ 
+-        This would pass the following prompts to the model:
+-        "<|user|>Is the following city the capital of France? Paris <|assistant|>"
+-        "<|user|>Is the following city the capital of France? London <|assistant|>"
+-        "<|user|>Is the following city the capital of France? Berlin <|assistant|>"
+-        The api would then return the probabilities of the model producing "Yes" and "No" as the next token.
+-        The output would look like:
+-        [[0.9, 0.1], [0.2, 0.8], [0.1, 0.9]]
++        For generation (CausalLM) models, returns the probability of each label_token_id
++        being generated after the query+item prompt. Example:
++            query = "<|user|>Is the following city the capital of France? "
++            items = ["Paris <|assistant|>", "London <|assistant|>"]
++            label_token_ids = [2332, 1223]  # "Yes" / "No"
++            # -> [[0.9, 0.1], [0.2, 0.8]]
+ 
++        For SequenceClassification models, returns the pooled class logits directly from
++        the classification head. label_token_ids is optional and ignored.
+ 
+         Args:
+-            query: The query text or pre-tokenized query token IDs. Must be provided.
+-            items: The item text(s) or pre-tokenized item token IDs. Must be provided.
+-            label_token_ids: List of token IDs to compute probabilities for. If None, no token probabilities will be computed.
+-            apply_softmax: Whether to normalize probabilities using softmax.
+-            item_first: If True, prepend items to query. Otherwise append items to query.
++            query: The query text or pre-tokenized token IDs.
++            items: The item text(s) or pre-tokenized token IDs.
++            label_token_ids: Token IDs to score (required for CausalLM; ignored for
++                SequenceClassification).
++            apply_softmax: Whether to normalize scores using softmax.
++            item_first: If True, prepend items before query (single-item mode only).
++            return_pooled_hidden_states: Whether to include raw pooled transformer
++                hidden states (before the task head) in the result. Only supported
++                for non-generation models (SequenceClassification, RewardModel).
+ 
+         Returns:
+-            ScoreResult with:
+-                scores: List of lists containing probabilities for each item and each label token
+-                prompt_tokens: The number of prompt tokens processed.
+-
+-        Raises:
+-            ValueError: If query is not provided, or if items is not provided,
+-                      or if token IDs are out of vocabulary, or if logprobs are not available for the specified tokens.
++            ScoreResult with scores (one list per item), prompt token count, and
++            optional pooled_hidden_states tensors.
+         """
+         return self.loop.run_until_complete(
+             self.tokenizer_manager.score_request(
+@@ -72,6 +69,7 @@ class EngineScoreMixin:
+                 apply_softmax=apply_softmax,
+                 item_first=item_first,
+                 request=None,
++                return_pooled_hidden_states=return_pooled_hidden_states,
+             )
+         )
+ 
+@@ -82,12 +80,9 @@ class EngineScoreMixin:
+         label_token_ids: Optional[List[int]] = None,
+         apply_softmax: bool = False,
+         item_first: bool = False,
++        return_pooled_hidden_states: bool = False,
+     ) -> ScoreResult:
+-        """
+-        Asynchronous version of score method.
+-
+-        See score() for detailed documentation.
+-        """
++        """Asynchronous version of score(). See score() for full documentation."""
+         return await self.tokenizer_manager.score_request(
+             query=query,
+             items=items,
+@@ -95,4 +90,5 @@ class EngineScoreMixin:
+             apply_softmax=apply_softmax,
+             item_first=item_first,
+             request=None,
++            return_pooled_hidden_states=return_pooled_hidden_states,
+         )
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 43afc1577..c460141c3 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -1642,7 +1642,7 @@ async def retrieve_model(model: str):
+ 
+ @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
+ async def v1_score_request(request: ScoringRequest, raw_request: Request):
+-    """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
++    """Endpoint for the scoring API. Supports CausalLM (logprob-based) and SequenceClassification (class logit-based) models. See Engine.score() for documentation."""
+     return await raw_request.app.state.openai_serving_score.handle_request(
+         request, raw_request
+     )
+diff --git a/python/sglang/srt/entrypoints/openai/protocol.py b/python/sglang/srt/entrypoints/openai/protocol.py
+index c40bd37d9..7678add9c 100644
+--- a/python/sglang/srt/entrypoints/openai/protocol.py
++++ b/python/sglang/srt/entrypoints/openai/protocol.py
+@@ -1000,6 +1000,7 @@ class ScoringRequest(BaseModel):
+     )
+     apply_softmax: bool = False
+     item_first: bool = False
++    return_pooled_hidden_states: bool = False
+     model: str = DEFAULT_MODEL_NAME
+ 
+ 
+@@ -1007,6 +1008,7 @@ class ScoringResponse(BaseModel):
+     scores: List[
+         List[float]
+     ]  # List of lists of probabilities, each in the order of label_token_ids
++    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
+     model: str
+     usage: Optional[UsageInfo] = None
+     object: str = "scoring"
+diff --git a/python/sglang/srt/entrypoints/openai/serving_score.py b/python/sglang/srt/entrypoints/openai/serving_score.py
+index e9fb5f8c0..03a131dd2 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_score.py
++++ b/python/sglang/srt/entrypoints/openai/serving_score.py
+@@ -2,6 +2,7 @@ import logging
+ from typing import Union
+ 
+ from fastapi import Request
++from fastapi.responses import ORJSONResponse
+ 
+ from sglang.srt.entrypoints.openai.protocol import (
+     ErrorResponse,
+@@ -50,17 +51,26 @@ class OpenAIServingScore(OpenAIServingBase):
+                 apply_softmax=request.apply_softmax,
+                 item_first=request.item_first,
+                 request=raw_request,
++                return_pooled_hidden_states=request.return_pooled_hidden_states,
+             )
+ 
++            phs_as_lists = None
++            if result.pooled_hidden_states is not None:
++                phs_as_lists = [
++                    t.tolist() if t is not None else None
++                    for t in result.pooled_hidden_states
++                ]
++
+             response = ScoringResponse(
+                 scores=result.scores,
++                pooled_hidden_states=phs_as_lists,
+                 model=request.model,
+                 usage=UsageInfo(
+                     prompt_tokens=result.prompt_tokens,
+                     total_tokens=result.prompt_tokens,
+                 ),
+             )
+-            return response
++            return ORJSONResponse(content=response.model_dump())
+ 
+         except ValueError as e:
+             return self.create_error_response(str(e))
+diff --git a/python/sglang/srt/layers/pooler.py b/python/sglang/srt/layers/pooler.py
+index f9f8e1a18..582bf0a97 100644
+--- a/python/sglang/srt/layers/pooler.py
++++ b/python/sglang/srt/layers/pooler.py
+@@ -1,16 +1,21 @@
+ # adapted from
+ # https://github.com/vllm-project/vllm/blob/82a1b1a82b1fbb454c82a9ef95730b929c9b270c/vllm/model_executor/layers/pooler.py
+ 
++from __future__ import annotations
++
+ from dataclasses import dataclass
+ from enum import IntEnum
+-from typing import Optional
++from typing import TYPE_CHECKING, List, Optional
+ 
+ import torch
+ import torch.nn as nn
+ from transformers import PretrainedConfig
+ 
+ from sglang.srt.layers.activation import get_cross_encoder_activation_function
+-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++from sglang.srt.server_args import get_global_server_args
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ 
+ 
+ class PoolingType(IntEnum):
+@@ -20,9 +25,107 @@ class PoolingType(IntEnum):
+ 
+ @dataclass
+ class EmbeddingPoolerOutput:
++    """Output of pooler or score_and_pool.
++
++    Attributes:
++        embeddings: Pooled embeddings or classification logits.  May be a list
++            of tensors when per-request matryoshka dim truncation produces
++            different shapes, or when MIS yields a variable number of scores
++            per request.
++        pooled_hidden_states: Raw transformer hidden states *before* the
++            task-specific head, present only when
++            ``forward_batch.return_pooled_hidden_states`` is True.  Tensor
++            (standard path) or list of tensors (MIS path, one per delimiter).
++    """
++
+     # Pooler can return list[tensor] instead of tensor if the dimension of each tensor in the batch is different
+     # due to different per-request matryoshka dim truncation
+     embeddings: torch.Tensor | list[torch.Tensor]
++    pooled_hidden_states: Optional[torch.Tensor | list[torch.Tensor]] = None
++
++
++def pool_hidden_states(
++    pooling_type: PoolingType,
++    hidden_states: torch.Tensor,
++    forward_batch: ForwardBatch,
++) -> torch.Tensor:
++    """Pool hidden_states by PoolingType (LAST/CLS).
++
++    Raw pooling only — no normalize, no dim truncation.
++    Returns shape (batch_size, hidden_size).
++    """
++    if pooling_type == PoolingType.LAST:
++        last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
++        return hidden_states[last_token_indices]
++    elif pooling_type == PoolingType.CLS:
++        prompt_lens = forward_batch.extend_seq_lens
++        first_token_flat_indices = torch.zeros_like(prompt_lens)
++        first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
++        return hidden_states[first_token_flat_indices]
++    else:
++        raise ValueError(f"Unsupported pooling type: {pooling_type}")
++
++
++def score_and_pool(
++    score_head: nn.Module,
++    pooler: "Pooler",
++    hidden_states: torch.Tensor,
++    forward_batch: ForwardBatch,
++    input_ids: torch.Tensor,
++) -> EmbeddingPoolerOutput:
++    """Apply a classification/score head with MIS and pooled-hidden-states support.
++
++    MIS path (when ``multi_item_scoring_delimiter`` is set and found in ``input_ids``):
++    extract hidden states at positions just before each delimiter, apply the score head,
++    then split per-request.
++
++    Standard path: apply the score head to all hidden states, then pool.
++
++    When ``forward_batch.return_pooled_hidden_states`` is True, the raw pooled
++    hidden states (before the score head) are included in the output.
++    """
++    delimiter_token = get_global_server_args().multi_item_scoring_delimiter
++    if delimiter_token is not None and forward_batch.is_prefill_only:
++        delim_positions = (input_ids == delimiter_token).nonzero(as_tuple=True)[0]
++        # A delimiter at flat index 0 has no preceding hidden state to pool
++        delim_positions = delim_positions[delim_positions > 0]
++
++        if delim_positions.numel() > 0:
++            # Score only the tokens that precede a delimiter
++            pre_delim_hidden = hidden_states[delim_positions - 1]
++            scores = score_head(pre_delim_hidden)
++
++            # Split per-request so the scheduler gets one tensor per request.
++            # Use CPU sequence lengths to avoid per-iteration GPU<->CPU sync
++            # from `.item()` calls on device tensors.
++            seq_lens = forward_batch.extend_seq_lens_cpu
++            start = 0
++            per_request_scores: List[torch.Tensor] = []
++            per_request_phs: Optional[List[torch.Tensor]] = (
++                [] if forward_batch.return_pooled_hidden_states else None
++            )
++            for seq_len in seq_lens:
++                end = start + seq_len
++                mask = (delim_positions >= start) & (delim_positions < end)
++                per_request_scores.append(scores[mask])
++                if per_request_phs is not None:
++                    per_request_phs.append(pre_delim_hidden[mask])
++                start = end
++
++            return EmbeddingPoolerOutput(
++                embeddings=per_request_scores,
++                pooled_hidden_states=per_request_phs,
++            )
++
++    # Standard classification path: pool hidden states, then score.
++    pooled_hs = pool_hidden_states(pooler.pooling_type, hidden_states, forward_batch)
++    scores = score_head(pooled_hs)
++    return EmbeddingPoolerOutput(
++        embeddings=scores,
++        pooled_hidden_states=(
++            pooled_hs if forward_batch.return_pooled_hidden_states else None
++        ),
++    )
+ 
+ 
+ class Pooler(nn.Module):
+@@ -44,17 +147,9 @@ class Pooler(nn.Module):
+     def forward(
+         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+     ) -> EmbeddingPoolerOutput:
+-
+-        if self.pooling_type == PoolingType.LAST:
+-            last_token_indices = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+-            pooled_data = hidden_states[last_token_indices]
+-        elif self.pooling_type == PoolingType.CLS:
+-            prompt_lens = forward_batch.extend_seq_lens
+-            first_token_flat_indices = torch.zeros_like(prompt_lens)
+-            first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
+-            pooled_data = hidden_states[first_token_flat_indices]
+-        else:
+-            raise ValueError(f"Invalid pooling type: {self.pooling_type}")
++        pooled_data = pool_hidden_states(
++            self.pooling_type, hidden_states, forward_batch
++        )
+ 
+         if forward_batch.dimensions is not None:
+             all_same_dimensions = len(set(forward_batch.dimensions)) == 1
+diff --git a/python/sglang/srt/managers/io_struct.py b/python/sglang/srt/managers/io_struct.py
+index 8c2e0bf7b..d3504fdd7 100644
+--- a/python/sglang/srt/managers/io_struct.py
++++ b/python/sglang/srt/managers/io_struct.py
+@@ -821,6 +821,9 @@ class EmbeddingReqInput(BaseReq):
+     # The uid of LoRA adaptors, should be initialized by tokenizer manager
+     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+ 
++    # Whether to return pooled hidden states (pre-head transformer output)
++    return_pooled_hidden_states: bool = False
++
+     def normalize_batch_and_arguments(self):
+         # at least one of text, input_ids, or image should be provided
+         if self.text is None and self.input_ids is None and self.image_data is None:
+@@ -911,6 +914,7 @@ class EmbeddingReqInput(BaseReq):
+                 lora_id=self.lora_id[i] if self.lora_id is not None else None,
+                 is_cross_encoder_request=True,
+                 http_worker_ipc=self.http_worker_ipc,
++                return_pooled_hidden_states=self.return_pooled_hidden_states,
+             )
+         else:
+             sub = EmbeddingReqInput(
+@@ -927,6 +931,7 @@ class EmbeddingReqInput(BaseReq):
+                 dimensions=self.dimensions,
+                 http_worker_ipc=self.http_worker_ipc,
+                 received_time=self.received_time,
++                return_pooled_hidden_states=self.return_pooled_hidden_states,
+             )
+         cache[i] = sub
+         return sub
+@@ -955,6 +960,9 @@ class TokenizedEmbeddingReqInput(BaseReq):
+     # For observability
+     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+ 
++    # Whether to return pooled hidden states (pre-head transformer output)
++    return_pooled_hidden_states: bool = False
++
+ 
+ @dataclass
+ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
+@@ -1123,6 +1131,12 @@ class BatchEmbeddingOutput(BaseBatchReq):
+     # For observability
+     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+ 
++    # Optional pooled hidden states (pre-head transformer output).
++    # Sent as a single stacked tensor to minimize pickle overhead.
++    pooled_hidden_states: Optional[
++        Union[List[Optional[torch.Tensor]], torch.Tensor]
++    ] = None
++
+ 
+ @dataclass
+ class ClearHiCacheReqInput(BaseReq):
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index 9eeab2572..446df8c7e 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -594,6 +594,7 @@ class Req(ReqDllmMixin):
+         time_stats: Optional[
+             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
+         ] = None,
++        return_pooled_hidden_states: bool = False,
+     ):
+         # Input and output info
+         self.rid = rid
+@@ -869,6 +870,10 @@ class Req(ReqDllmMixin):
+         # For Matryoshka embeddings
+         self.dimensions = dimensions
+ 
++        # Whether to return pooled hidden states (pre-head transformer output)
++        self.return_pooled_hidden_states = return_pooled_hidden_states
++        self.pooled_hidden_state = None
++
+         # For diffusion LLM
+         self.init_diffusion_llm(dllm_config)
+ 
+@@ -1391,6 +1396,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+     # For matryoshka embeddings
+     dimensions: Optional[list[int]] = None
+ 
++    # Whether to return pooled hidden states (pre-head transformer output)
++    return_pooled_hidden_states: bool = False
++
+     # For split prefill
+     split_index: int = 0
+     split_prefill_finished: bool = False
+@@ -1582,6 +1590,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+                 for r in reqs
+             ]
+ 
++        # OR across the batch so ForwardBatch matches a single fused forward; requests
++        # that did not ask for PHS still skip attaching it in the output processor.
++        self.return_pooled_hidden_states = any(
++            r.return_pooled_hidden_states for r in reqs
++        )
++
+         token_type_ids = [
+             r.token_type_ids for r in reqs if r.token_type_ids is not None
+         ]
+@@ -2386,6 +2400,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+             is_prefill_only=self.is_prefill_only,
+             dimensions=self.dimensions,
++            return_pooled_hidden_states=self.return_pooled_hidden_states,
+             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+             dllm_config=self.dllm_config,
+             reqs=self.reqs,
+@@ -2561,6 +2576,9 @@ class ModelWorkerBatch:
+     # For matryoshka embeddings
+     dimensions: Optional[list[int]] = None
+ 
++    # Whether to return pooled hidden states (pre-head transformer output)
++    return_pooled_hidden_states: bool = False
++
+     # Whether this batch is prefill-only (no token generation needed)
+     is_prefill_only: bool = False
+ 
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 377a7ec74..8bd3f34ac 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -254,12 +254,22 @@ _is_npu = is_npu()
+ 
+ @dataclass
+ class EmbeddingBatchResult:
++    """Result from an embedding/classification forward pass.
++
++    Attributes:
++        embeddings: Model output — pooled embeddings or classification logits.
++        pooled_hidden_states: Raw hidden states before the task head.  Present
++            only when the batch contained ``return_pooled_hidden_states=True``
++            requests.  Tensor (uniform shapes) or list of tensors (MIS).
++        copy_done: CUDA event recorded after the async CPU copy completes.
++    """
++
+     embeddings: torch.Tensor
++    pooled_hidden_states: Optional[torch.Tensor] = None
+     copy_done: Optional[torch.cuda.Event] = None
+ 
+     def copy_to_cpu(self):
+-        """Copy embeddings tensor to CPU in overlap scheduling."""
+-
++        """Copy embeddings and pooled hidden states to CPU for overlap scheduling."""
+         if isinstance(self.embeddings, torch.Tensor):
+             self.copy_done = torch.get_device_module(self.embeddings.device).Event()
+             self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+@@ -273,6 +283,16 @@ class EmbeddingBatchResult:
+                 emb.to("cpu", non_blocking=True) for emb in self.embeddings
+             ]
+ 
++        if self.pooled_hidden_states is not None:
++            if isinstance(self.pooled_hidden_states, list):
++                self.pooled_hidden_states = [
++                    t.to("cpu", non_blocking=True) for t in self.pooled_hidden_states
++                ]
++            else:
++                self.pooled_hidden_states = self.pooled_hidden_states.to(
++                    "cpu", non_blocking=True
++                )
++
+         self.copy_done.record()
+ 
+ 
+@@ -2135,6 +2155,7 @@ class Scheduler(
+             lora_id=recv_req.lora_id,
+             http_worker_ipc=recv_req.http_worker_ipc,
+             time_stats=recv_req.time_stats,
++            return_pooled_hidden_states=recv_req.return_pooled_hidden_states,
+         )
+         req.tokenizer = self.tokenizer
+ 
+@@ -2813,14 +2834,22 @@ class Scheduler(
+                 self.record_batch_in_overlap(model_worker_batch)
+                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                     self.forward_stream.wait_stream(self.schedule_stream)
+-                    embeddings = self.tp_worker.forward_batch_embedding(
++                    pooler_output = self.tp_worker.forward_batch_embedding(
+                         model_worker_batch
+                     )
+-                    ret = EmbeddingBatchResult(embeddings=embeddings)
++                    ret = EmbeddingBatchResult(
++                        embeddings=pooler_output.embeddings,
++                        pooled_hidden_states=pooler_output.pooled_hidden_states,
++                    )
+                     ret.copy_to_cpu()
+             else:
+-                embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+-                ret = EmbeddingBatchResult(embeddings=embeddings)
++                pooler_output = self.tp_worker.forward_batch_embedding(
++                    model_worker_batch
++                )
++                ret = EmbeddingBatchResult(
++                    embeddings=pooler_output.embeddings,
++                    pooled_hidden_states=pooler_output.pooled_hidden_states,
++                )
+ 
+         # Capture prefill end time for EXTEND mode
+         if batch.forward_mode == ForwardMode.EXTEND:
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index e135dfb92..cc5c3eef3 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -284,6 +284,7 @@ class SchedulerOutputProcessorMixin:
+             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+ 
+             embeddings = result.embeddings
++            phs = result.pooled_hidden_states
+ 
+             if is_sparse:
+                 batch_ids, token_ids = embeddings.indices()
+@@ -300,12 +301,20 @@ class SchedulerOutputProcessorMixin:
+                 else:
+                     embeddings = [tensor.tolist() for tensor in embeddings]
+ 
++            if phs is not None:
++                if isinstance(phs, list):
++                    phs = [t.cpu().detach() for t in phs]
++                else:
++                    phs = phs.cpu().detach()
++
+             # Check finish conditions
+             for i, req in enumerate(batch.reqs):
+                 if req.is_retracted:
+                     continue
+ 
+                 req.embedding = embeddings[i]
++                if req.return_pooled_hidden_states and phs is not None:
++                    req.pooled_hidden_state = phs[i]
+                 if req.is_chunked <= 0:
+                     req.time_stats.set_prefill_finished_time()
+                     # Dummy output token for embedding models
+@@ -1213,6 +1222,8 @@ class SchedulerOutputProcessorMixin:
+         cached_tokens_details = []  # Detailed breakdown by cache source
+         time_stats = []
+         retraction_counts = []
++        phs_list = []
++        has_phs = False
+         for req in reqs:
+             if req.finished():
+                 rids.append(req.rid)
+@@ -1226,6 +1237,28 @@ class SchedulerOutputProcessorMixin:
+                 cached_tokens_details.append(self._get_cached_tokens_details(req))
+                 time_stats.append(req.time_stats)
+                 retraction_counts.append(req.retraction_count)
++
++                phs = req.pooled_hidden_state
++                phs_list.append(phs)
++                if phs is not None:
++                    has_phs = True
++
++        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
++        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
++        # *every* entry is non-None (homogeneous batch); mixed batches
++        # (some requests want PHS, others don't) keep the raw list so
++        # positional indexing on the receiver side stays correct.
++        stacked_phs = None
++        if has_phs:
++            all_have_phs = all(t is not None for t in phs_list)
++            if all_have_phs:
++                if all(t.shape == phs_list[0].shape for t in phs_list):
++                    stacked_phs = torch.stack(phs_list)
++                else:
++                    stacked_phs = phs_list
++            else:
++                stacked_phs = phs_list
++
+         self.send_to_detokenizer.send_output(
+             BatchEmbeddingOutput(
+                 rids=rids,
+@@ -1239,5 +1272,6 @@ class SchedulerOutputProcessorMixin:
+                 placeholder_tokens_idx=None,
+                 placeholder_tokens_val=None,
+                 retraction_counts=retraction_counts,
++                pooled_hidden_states=stacked_phs,
+             )
+         )
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 2f2876a8d..189861d21 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -1026,6 +1026,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+                 dimensions=obj.dimensions,
+                 lora_id=obj.lora_id,
+                 http_worker_ipc=obj.http_worker_ipc,
++                return_pooled_hidden_states=obj.return_pooled_hidden_states,
+             )
+ 
+         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
+@@ -1679,6 +1680,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
+                     "embedding": recv_obj.embeddings[i],
+                     "meta_info": meta_info,
+                 }
++                if (
++                    recv_obj.pooled_hidden_states is not None
++                    and recv_obj.pooled_hidden_states[i] is not None
++                ):
++                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+ 
+             state.finished = recv_obj.finished_reasons[i] is not None
+ 
+diff --git a/python/sglang/srt/managers/tokenizer_manager_score_mixin.py b/python/sglang/srt/managers/tokenizer_manager_score_mixin.py
+index 593bd8757..aec3cee71 100644
+--- a/python/sglang/srt/managers/tokenizer_manager_score_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_manager_score_mixin.py
+@@ -1,9 +1,12 @@
+ import logging
+ import math
+ from dataclasses import dataclass
+-from typing import Any, Dict, List, Optional, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+-from sglang.srt.managers.io_struct import GenerateReqInput
++import torch
++
++from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
++from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -11,7 +14,13 @@ logger = logging.getLogger(__name__)
+ @dataclass(frozen=True, slots=True)
+ class ScoreResult:
+     scores: List[List[float]]
+-    prompt_tokens: int
++    prompt_tokens: int = 0
++    # Per-item pooled hidden states (pre-head transformer output).
++    # CPU tensors when return_pooled_hidden_states=True; kept as tensors so
++    # in-process consumers (gRPC, engine API) avoid a .tolist() round-trip.
++    # The HTTP path converts to lists in serving_score.py before JSON serialization.
++    # Same layout as scores: one tensor per item (not a single packed 2D tensor).
++    pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
+ 
+ 
+ class TokenizerManagerScoreMixin:
+@@ -110,17 +119,53 @@ class TokenizerManagerScoreMixin:
+ 
+         return combined_sequence
+ 
++    def _batch_tokenize_query_and_items(
++        self,
++        query: Optional[Union[str, List[int]]],
++        items: Optional[Union[str, List[str], List[List[int]]]],
++    ) -> Tuple[List[int], List[List[int]]]:
++        """
++        Tokenize query and items into token IDs.
++
++        Args:
++            query: The query text (str) or pre-tokenized token IDs (List[int]).
++            items: Item texts or pre-tokenized token IDs.
++
++        Returns:
++            (query_ids, items_ids): query token IDs and list of per-item token IDs.
++        """
++        if isinstance(query, str):
++            query_ids = self.tokenizer.encode(query)
++        else:
++            query_ids = list(query)
++
++        items_list = [items] if isinstance(items, str) else items
++
++        items_ids = []
++        for item in items_list:
++            if isinstance(item, str):
++                items_ids.append(self.tokenizer.encode(item))
++            else:
++                items_ids.append(list(item))
++
++        return query_ids, items_ids
++
+     def _process_multi_item_scoring_results(
+         self,
+         results: Any,
+         items: List,
+-        label_token_ids: List[int],
++        label_token_ids: Optional[List[int]],
+         apply_softmax: bool,
+         batch_request=None,
++        return_pooled_hidden_states: bool = False,
+     ) -> ScoreResult:
+         """
+         Process results from multi-item scoring request.
+-        Extracts logprobs at delimiter positions from input_token_ids_logprobs.
++
++        Extracts per-delimiter scores from whichever field the scheduler
++        populated (input_token_ids_logprobs for generation models,
++        embedding for classification models), then uniformly validates,
++        skips the query-boundary delimiter, and normalizes.
+ 
+         Args:
+             results: Results from generate_request
+@@ -128,96 +173,161 @@ class TokenizerManagerScoreMixin:
+             label_token_ids: Token IDs to extract scores for
+             apply_softmax: Whether to apply softmax normalization
+             batch_request: The original batch request containing input sequence
++            return_pooled_hidden_states: Whether to extract pooled hidden states
++                from the result and include them in the ScoreResult.
+ 
+         Returns:
+-            ScoreResult with:
+-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+-                prompt_tokens: The number of prompt tokens processed.
++            ScoreResult with per-item scores, prompt token count, and optional
++            pooled_hidden_states (when return_pooled_hidden_states=True and the
++            model populated the field).
+         """
+-        result = results[0] if isinstance(results, list) else results
+-        meta_info = result.get("meta_info", {})
+-
+-        # For multi-item scoring, logprobs are in input_token_ids_logprobs
+-        input_logprobs = meta_info.get("input_token_ids_logprobs", [])
+-        prompt_tokens = meta_info.get("prompt_tokens", 0)
++        single_result = results[0] if isinstance(results, list) else results
++        meta_info = single_result.get("meta_info", {})
++        num_items = len(items) if isinstance(items, list) else 1
++        expected_count = num_items + 1
+         request_id = meta_info.get("id", "<unknown>")
++        prompt_tokens = meta_info.get("prompt_tokens", 0)
+ 
+-        if not input_logprobs:
++        # Extract per-delimiter scores from whichever field has them
++        input_logprobs = meta_info.get("input_token_ids_logprobs", [])
++        embedding = single_result.get("embedding")
++
++        if input_logprobs:
++            # Generation model: extract label-token logprobs at each delimiter
++            per_delimiter_scores = []
++            for logprobs_data in input_logprobs:
++                logprobs = self._extract_logprobs_for_tokens(
++                    logprobs_data, label_token_ids
++                )
++                score_list = self._convert_logprobs_to_scores(
++                    logprobs, label_token_ids, apply_softmax
++                )
++                per_delimiter_scores.append(score_list)
++        elif embedding is not None:
++            # Classification model: scores are directly in 2D embedding.
++            if apply_softmax:
++                scores_tensor = (
++                    torch.tensor(embedding)
++                    if isinstance(embedding, list)
++                    else embedding
++                )
++                scores_tensor = torch.nn.functional.softmax(scores_tensor, dim=-1)
++                per_delimiter_scores = scores_tensor.tolist()
++            else:
++                per_delimiter_scores = (
++                    embedding if isinstance(embedding, list) else embedding.tolist()
++                )
++        else:
+             raise RuntimeError(
+-                f"input_token_ids_logprobs is empty for multi-item scoring request {request_id}. "
+-                "This indicates token_ids_logprobs were not computed properly for Multi-Item Scoring."
++                f"No scoring data found for multi-item scoring request {request_id}. "
++                "Expected either input_token_ids_logprobs or embedding."
+             )
+ 
+-        scores = []
+-        num_items = len(items) if isinstance(items, list) else 1
+-
+-        # Check if we have the expected number of logprobs
+-        expected_logprobs_count = num_items + 1
+-        if len(input_logprobs) != expected_logprobs_count:
++        # Validate delimiter count
++        if len(per_delimiter_scores) != expected_count:
+             raise RuntimeError(
+-                f"Expected {expected_logprobs_count} input_token_ids_logprobs for multi-item scoring "
+-                f"with {num_items} items, but got {len(input_logprobs)}. "
++                f"Expected {expected_count} delimiter entries for multi-item scoring "
++                f"with {num_items} items, but got {len(per_delimiter_scores)}. "
+                 f"Request ID: {request_id}"
+             )
+ 
+-        # Skip the first delimiter (between query and first item) and process remaining delimiter positions
+-        # We want to exclude the first one since it represents the boundary between query and first item, not an item boundary
+-        start_idx = 1 if len(input_logprobs) > 1 else 0
++        # Skip the first delimiter (query-item boundary)
++        scores = per_delimiter_scores[1:]
+ 
+-        # Process logprobs for each item position (excluding first delimiter)
+-        for item_idx in range(num_items):
+-            logprob_idx = start_idx + item_idx
+-            item_logprobs_data = input_logprobs[logprob_idx]
+-            logprobs = self._extract_logprobs_for_tokens(
+-                item_logprobs_data, label_token_ids
+-            )
+-            score_list = self._convert_logprobs_to_scores(
+-                logprobs, label_token_ids, apply_softmax
+-            )
+-            scores.append(score_list)
++        phs_list = None
++        if return_pooled_hidden_states:
++            raw_phs = single_result.get("pooled_hidden_state")
++            if raw_phs is not None and len(raw_phs) == expected_count:
++                phs_list = raw_phs[1:]
+ 
+-        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
++        return ScoreResult(
++            scores=scores,
++            prompt_tokens=prompt_tokens,
++            pooled_hidden_states=phs_list,
++        )
+ 
+     def _process_single_item_scoring_results(
+-        self, results: Any, label_token_ids: List[int], apply_softmax: bool
++        self,
++        results: Any,
++        label_token_ids: Optional[List[int]],
++        apply_softmax: bool,
++        return_pooled_hidden_states: bool = False,
+     ) -> ScoreResult:
+         """
+         Process results from single-item scoring request.
+-        Single-item scoring results are stored in output_token_ids_logprobs.
++
++        For generation (CausalLM) models: reads output_token_ids_logprobs.
++        For non-generation (SequenceClassification) models: reads the embedding field
++        which contains pooled class logits from the classification head.
+ 
+         Args:
+             results: Results from generate_request
+-            label_token_ids: Token IDs to extract scores for
++            label_token_ids: Token IDs to extract scores for (generation models only)
+             apply_softmax: Whether to apply softmax normalization
++            return_pooled_hidden_states: Whether to extract pooled hidden states
+ 
+         Returns:
+-            ScoreResult with:
+-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+-                prompt_tokens: The number of prompt tokens processed.
++            ScoreResult with per-item scores, prompt token count, and optional pooled_hidden_states.
+         """
+         scores = []
++        phs_list = []
++        has_phs = False
+         prompt_tokens = 0
+ 
+-        for result in results:
+-            # For single-item scoring, logprobs are in output_token_ids_logprobs
+-            output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+-            prompt_tokens += result["meta_info"].get("prompt_tokens", 0)
+-
+-            if not output_logprobs or len(output_logprobs) == 0:
+-                raise RuntimeError(
+-                    f"output_logprobs is empty for request {result['meta_info'].get('id', '<unknown>')}."
++        is_generation = getattr(self, "is_generation", True)
++        if is_generation:
++            for result in results:
++                # For single-item scoring, logprobs are in output_token_ids_logprobs
++                output_logprobs = result["meta_info"].get(
++                    "output_token_ids_logprobs", []
+                 )
++                prompt_tokens += result["meta_info"].get("prompt_tokens", 0)
+ 
+-            # Extract logprobs for the first (and only) position
+-            logprobs = self._extract_logprobs_for_tokens(
+-                output_logprobs[0], label_token_ids
+-            )
+-            score_list = self._convert_logprobs_to_scores(
+-                logprobs, label_token_ids, apply_softmax
+-            )
+-            scores.append(score_list)
++                if not output_logprobs or len(output_logprobs) == 0:
++                    raise RuntimeError(
++                        f"output_logprobs is empty for request "
++                        f"{result['meta_info'].get('id', '<unknown>')}."
++                    )
+ 
+-        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
++                # Extract logprobs for the first (and only) position
++                logprobs = self._extract_logprobs_for_tokens(
++                    output_logprobs[0], label_token_ids
++                )
++                score_list = self._convert_logprobs_to_scores(
++                    logprobs, label_token_ids, apply_softmax
++                )
++                scores.append(score_list)
++        else:
++            for result in results:
++                embedding = result.get("embedding", None)
++                if embedding is None:
++                    raise ValueError("Embedding not found in the result.")
++
++                prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
++
++                if apply_softmax:
++                    embedding = torch.softmax(
++                        torch.as_tensor(embedding), dim=-1
++                    ).tolist()
++
++                # The classification head produces per-token logits, which the pooler reduces
++                # into a single vector per input. That vector is returned in the `.embeddings`
++                # field — not as semantic embeddings, but as pooled classification logits.
++                # The field name is reused for compatibility with the existing
++                # EmbeddingPoolerOutput API.
++                scores.append(embedding)
++
++                if return_pooled_hidden_states:
++                    phs = result.get("pooled_hidden_state")
++                    phs_list.append(phs)
++                    if phs is not None:
++                        has_phs = True
++
++        return ScoreResult(
++            scores=scores,
++            prompt_tokens=prompt_tokens,
++            pooled_hidden_states=phs_list if has_phs else None,
++        )
+ 
+     async def score_request(
+         self,
+@@ -227,6 +337,7 @@ class TokenizerManagerScoreMixin:
+         apply_softmax: bool = False,
+         item_first: bool = False,
+         request: Optional[Any] = None,
++        return_pooled_hidden_states: bool = False,
+     ) -> ScoreResult:
+         """
+         Score the probability of specified token IDs appearing after the given (query + item) pair.
+@@ -242,6 +353,10 @@ class TokenizerManagerScoreMixin:
+            - Text: query<delimiter_text>item1<delimiter_text>item2<delimiter_text>item3<delimiter_text>
+            - Tokens: query<delimiter_token_id>item1<delimiter_token_id>item2<delimiter_token_id>item3<delimiter_token_id>
+ 
++        Supports two model types:
++        - Generation (CausalLM): Requires label_token_ids; returns logprob-based scores.
++        - SequenceClassification: label_token_ids is optional; returns pooled class logits.
++
+         Args:
+             query: The query text or pre-tokenized query token IDs
+             items: The item text(s) or pre-tokenized item token IDs
+@@ -249,21 +364,32 @@ class TokenizerManagerScoreMixin:
+             apply_softmax: Whether to normalize probabilities using softmax
+             item_first: If True, prepend items to query. Ignored for multi-item scoring.
+             request: Optional FastAPI request object
++            return_pooled_hidden_states: Whether to include the raw pooled transformer
++                hidden states (before the task-specific head) in the result. Only
++                supported for non-generation models (SequenceClassification,
++                RewardModel). Raises ValueError for CausalLM models.
+ 
+         Returns:
+             ScoreResult with:
+-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
++                scores: List of score lists, one per item.
+                 prompt_tokens: The number of prompt tokens processed.
++                pooled_hidden_states: Per-item CPU tensors when
++                    return_pooled_hidden_states=True and the model supports it;
++                    None otherwise.
+         """
+-        if label_token_ids is None:
+-            raise ValueError("label_token_ids must be provided")
++        is_generation = getattr(self, "is_generation", True)
++
++        if is_generation and label_token_ids is None:
++            raise ValueError(
++                "label_token_ids is required for generation (CausalLM) models."
++            )
+ 
+         if items is None:
+             raise ValueError("items must be provided")
+         if not items:
+             return ScoreResult(scores=[], prompt_tokens=0)
+ 
+-        if self.tokenizer is not None:
++        if self.tokenizer is not None and label_token_ids is not None:
+             vocab_size = self.tokenizer.vocab_size
+             for token_id in label_token_ids:
+                 if token_id >= vocab_size:
+@@ -277,14 +403,8 @@ class TokenizerManagerScoreMixin:
+             and self.multi_item_delimiter_text is not None
+         )
+ 
+-        batch_request = GenerateReqInput(
+-            token_ids_logprob=label_token_ids,
+-            return_logprob=True,
+-            # Set logprob_start_len=0 for multi-item scoring since we want logprobs at all delimiter positions
+-            logprob_start_len=0 if use_multi_item_scoring else -1,
+-            stream=False,
+-            sampling_params={"max_new_tokens": 0},
+-        )
++        input_ids = None
++        text_prompts = None
+ 
+         # Handle string or tokenized query/items
+         if isinstance(query, str) and (
+@@ -295,21 +415,23 @@ class TokenizerManagerScoreMixin:
+             items_list = [items] if isinstance(items, str) else items
+ 
+             if use_multi_item_scoring:
+-                # Multi-item scoring: create single prompt with delimiter text
+-                # Always use format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
+-                # (item_first is ignored for multi-item scoring)
+-                delimiter = self.multi_item_delimiter_text
+-                combined_items = delimiter.join(items_list)
+-                # Add final delimiter after the last item for logprob extraction
+-                single_prompt = f"{query}{delimiter}{combined_items}{delimiter}"
+-                batch_request.text = [single_prompt]
++                # Multi-item scoring: tokenize separately then combine at token level
++                # to ensure the delimiter token ID is inserted exactly once per boundary
++                # (a text-level roundtrip through the tokenizer can alter boundary tokens)
++                delimiter_token_id = self.server_args.multi_item_scoring_delimiter
++                query_ids, items_ids = self._batch_tokenize_query_and_items(
++                    query, items_list
++                )
++                combined_input_ids = self._build_multi_item_token_sequence(
++                    query_ids, items_ids, delimiter_token_id
++                )
++                input_ids = [combined_input_ids]
+             else:
+                 # Single-item scoring: create separate prompts for each item
+                 if item_first:
+-                    prompts = [f"{item}{query}" for item in items_list]
++                    text_prompts = [f"{item}{query}" for item in items_list]
+                 else:
+-                    prompts = [f"{query}{item}" for item in items_list]
+-                batch_request.text = prompts
++                    text_prompts = [f"{query}{item}" for item in items_list]
+ 
+         elif (
+             isinstance(query, list)
+@@ -325,30 +447,70 @@ class TokenizerManagerScoreMixin:
+                 combined_input_ids = self._build_multi_item_token_sequence(
+                     query, items, delimiter_token_id
+                 )
+-                batch_request.input_ids = [combined_input_ids]
++                input_ids = [combined_input_ids]
+             else:
+                 # Single-item scoring: process each item separately
+                 if item_first:
+-                    input_ids_list = [item + query for item in items]
++                    input_ids = [item + query for item in items]
+                 else:
+-                    input_ids_list = [query + item for item in items]
+-                batch_request.input_ids = input_ids_list
++                    input_ids = [query + item for item in items]
+         else:
+             raise ValueError(
+                 "Invalid combination of query/items types for score_request."
+             )
+ 
++        if return_pooled_hidden_states:
++            if is_generation:
++                raise ValueError(
++                    "return_pooled_hidden_states is not supported for CausalLM models. "
++                    "It requires a model with a task-specific head "
++                    "(e.g. SequenceClassification or RewardModel)."
++                )
++            model_config = getattr(self, "model_config", None)
++            if model_config is not None:
++                archs = getattr(model_config.hf_config, "architectures", []) or []
++                if is_cross_encoding_pooler_model(archs):
++                    raise ValueError(
++                        f"return_pooled_hidden_states is not supported for "
++                        f"{archs[0]}. This model uses CrossEncodingPooler which "
++                        f"does not expose pre-head hidden states."
++                    )
++
++        # Create the appropriate request type
++        if is_generation:
++            batch_request = GenerateReqInput(
++                text=text_prompts,
++                input_ids=input_ids,
++                token_ids_logprob=label_token_ids,
++                return_logprob=True,
++                # Set logprob_start_len=0 for multi-item scoring since we want logprobs at all delimiter positions
++                logprob_start_len=0 if use_multi_item_scoring else -1,
++                stream=False,
++                sampling_params={"max_new_tokens": 0},
++            )
++        else:
++            batch_request = EmbeddingReqInput(
++                text=text_prompts,
++                input_ids=input_ids,
++                return_pooled_hidden_states=return_pooled_hidden_states,
++            )
++
+         results = await self.generate_request(batch_request, request).__anext__()
+ 
+         if use_multi_item_scoring:
+-            # Multi-item scoring: extract scores from input_token_ids_logprobs
++            # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding
+             return self._process_multi_item_scoring_results(
+-                results, items, label_token_ids, apply_softmax, batch_request
++                results,
++                items,
++                label_token_ids,
++                apply_softmax,
++                batch_request,
++                return_pooled_hidden_states,
+             )
+         else:
+             # Single-item scoring: process each result separately
+             return self._process_single_item_scoring_results(
+-                results, label_token_ids, apply_softmax
++                results, label_token_ids, apply_softmax, return_pooled_hidden_states
+             )
+ 
+     def _convert_logprobs_to_scores(
+@@ -368,8 +530,6 @@ class TokenizerManagerScoreMixin:
+         Returns:
+             List of scores in the same order as label_token_ids
+         """
+-        import torch
+-
+         score_list = [
+             logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
+         ]
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 7f63610da..d9a4695f6 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -210,9 +210,8 @@ class BaseTpWorker(ABC):
+ 
+     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
+         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+-        logits_output = self.model_runner.forward(forward_batch).logits_output
+-        embeddings = logits_output.embeddings
+-        return embeddings
++        output = self.model_runner.forward(forward_batch).logits_output
++        return output  # Returns EmbeddingPoolerOutput
+ 
+ 
+ class TpModelWorker(BaseTpWorker):
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index eaecdc54b..e550ddffd 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -423,6 +423,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+     # For hidden states before normal
+     return_hidden_states_before_norm: bool = False
+ 
++    # Whether to return pooled hidden states (pre-head transformer output)
++    return_pooled_hidden_states: bool = False
++
+     # For hisparse
+     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+ 
+@@ -477,6 +480,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+             tbo_split_seq_index=batch.tbo_split_seq_index,
+             dimensions=batch.dimensions,
+             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
++            return_pooled_hidden_states=batch.return_pooled_hidden_states,
+             rids=[req.rid for req in batch.reqs],
+         )
+         device = model_runner.device
+diff --git a/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py b/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
+index 6f0ba95a4..68b3ee563 100644
+--- a/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py
+@@ -206,6 +206,9 @@ class PiecewiseCudaGraphRunner:
+ 
+         self.is_multimodal = model_runner.is_multimodal
+         self.mamba_track_enabled = self.is_mamba_track_enabled()
++        # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
++        # CUDA graph capture must use the same flag value as replay for those models.
++        self.capture_return_pooled_hidden_states = not model_runner.is_generation
+ 
+         # Graph inputs
+         with torch.device(self.device):
+@@ -389,6 +392,7 @@ class PiecewiseCudaGraphRunner:
+                 num_token_non_padded=None,
+                 global_forward_mode=ForwardMode.EXTEND,
+                 lora_ids=None,
++                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
+             )
+ 
+         # Attention backend
+@@ -546,6 +550,7 @@ class PiecewiseCudaGraphRunner:
+                 num_token_non_padded=None,
+                 global_forward_mode=ForwardMode.EXTEND,
+                 lora_ids=None,
++                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
+             )
+             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+ 
+@@ -742,6 +747,10 @@ class PiecewiseCudaGraphRunner:
+             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
+             top_p=forward_batch.top_p,
+             dimensions=forward_batch.dimensions,
++            return_pooled_hidden_states=(
++                self.capture_return_pooled_hidden_states
++                or forward_batch.return_pooled_hidden_states
++            ),
+         )
+ 
+         if out_cache_loc_swa is not None:
+diff --git a/python/sglang/srt/models/gemma2_reward.py b/python/sglang/srt/models/gemma2_reward.py
+index 03bea4d10..8c8eda22b 100644
+--- a/python/sglang/srt/models/gemma2_reward.py
++++ b/python/sglang/srt/models/gemma2_reward.py
+@@ -61,7 +61,12 @@ class Gemma2ForSequenceClassification(nn.Module):
+         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+         scores = self.score(last_token_hidden)
+ 
+-        return EmbeddingPoolerOutput(scores)
++        return EmbeddingPoolerOutput(
++            embeddings=scores,
++            pooled_hidden_states=(
++                last_token_hidden if forward_batch.return_pooled_hidden_states else None
++            ),
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         Gemma2ForCausalLM.load_weights(self, weights)
+diff --git a/python/sglang/srt/models/internlm2_reward.py b/python/sglang/srt/models/internlm2_reward.py
+index 68be8d001..6fb4587fe 100644
+--- a/python/sglang/srt/models/internlm2_reward.py
++++ b/python/sglang/srt/models/internlm2_reward.py
+@@ -55,7 +55,12 @@ class InternLM2ForRewardModel(nn.Module):
+         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+         scores = self.v_head(last_token_hidden)
+-        return EmbeddingPoolerOutput(scores)
++        return EmbeddingPoolerOutput(
++            embeddings=scores,
++            pooled_hidden_states=(
++                last_token_hidden if forward_batch.return_pooled_hidden_states else None
++            ),
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         return InternLM2ForCausalLM.load_weights(self, weights)
+diff --git a/python/sglang/srt/models/llama_classification.py b/python/sglang/srt/models/llama_classification.py
+index 8387d2030..6d991789e 100644
+--- a/python/sglang/srt/models/llama_classification.py
++++ b/python/sglang/srt/models/llama_classification.py
+@@ -18,7 +18,12 @@ import torch
+ from torch import nn
+ from transformers import LlamaConfig
+ 
+-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
++from sglang.srt.layers.pooler import (
++    EmbeddingPoolerOutput,
++    Pooler,
++    PoolingType,
++    score_and_pool,
++)
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+@@ -59,10 +64,13 @@ class LlamaForClassification(nn.Module):
+         ), "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+ 
+         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+-        last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+-        scores = self.classification_head(last_token_hidden)
+-
+-        return EmbeddingPoolerOutput(scores)
++        return score_and_pool(
++            self.classification_head,
++            self.pooler,
++            hidden_states,
++            forward_batch,
++            input_ids,
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         params_dict = dict(self.named_parameters())
+diff --git a/python/sglang/srt/models/llama_reward.py b/python/sglang/srt/models/llama_reward.py
+index 2f78dfa1b..a8e0f04e6 100644
+--- a/python/sglang/srt/models/llama_reward.py
++++ b/python/sglang/srt/models/llama_reward.py
+@@ -18,7 +18,12 @@ import torch
+ from torch import nn
+ from transformers import LlamaConfig
+ 
+-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
++from sglang.srt.layers.pooler import (
++    EmbeddingPoolerOutput,
++    Pooler,
++    PoolingType,
++    pool_hidden_states,
++)
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
+@@ -61,7 +66,12 @@ class LlamaForSequenceClassification(nn.Module):
+         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
+         scores = self.score(last_token_hidden)
+ 
+-        return EmbeddingPoolerOutput(scores)
++        return EmbeddingPoolerOutput(
++            embeddings=scores,
++            pooled_hidden_states=(
++                last_token_hidden if forward_batch.return_pooled_hidden_states else None
++            ),
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         return LlamaForCausalLM.load_weights(self, weights)
+@@ -114,7 +124,17 @@ class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassific
+             -1, self.num_labels // 2
+         )
+         scores = (rews * pooled_weights).sum(dim=-1).view(-1, 1)
+-        return EmbeddingPoolerOutput(scores)
++
++        pooled_hidden = None
++        if forward_batch.return_pooled_hidden_states:
++            pooled_hidden = pool_hidden_states(
++                self.pooler.pooling_type, hidden_states, forward_batch
++            )
++
++        return EmbeddingPoolerOutput(
++            embeddings=scores,
++            pooled_hidden_states=pooled_hidden,
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         return super().load_weights(weights)
+diff --git a/python/sglang/srt/models/qwen2_classification.py b/python/sglang/srt/models/qwen2_classification.py
+index 366213e70..a16ad64fa 100644
+--- a/python/sglang/srt/models/qwen2_classification.py
++++ b/python/sglang/srt/models/qwen2_classification.py
+@@ -18,7 +18,12 @@ import torch
+ from torch import nn
+ from transformers import Qwen2Config
+ 
+-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
++from sglang.srt.layers.pooler import (
++    EmbeddingPoolerOutput,
++    Pooler,
++    PoolingType,
++    score_and_pool,
++)
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
+@@ -57,10 +62,9 @@ class Qwen2ForSequenceClassification(nn.Module):
+         ), "Qwen2ForSequenceClassification is only used for embedding"
+ 
+         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+-        logits = self.score(hidden_states)
+-        pooled_logits = self.pooler(logits, forward_batch).embeddings
+-
+-        return EmbeddingPoolerOutput(pooled_logits)
++        return score_and_pool(
++            self.score, self.pooler, hidden_states, forward_batch, input_ids
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         # Filter out lm_head weights of Qwen2ForCausalLM
+diff --git a/python/sglang/srt/models/qwen2_rm.py b/python/sglang/srt/models/qwen2_rm.py
+index f5ed9eae2..aedebd178 100644
+--- a/python/sglang/srt/models/qwen2_rm.py
++++ b/python/sglang/srt/models/qwen2_rm.py
+@@ -18,7 +18,12 @@ import torch
+ from torch import nn
+ from transformers import Qwen2Config
+ 
+-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
++from sglang.srt.layers.pooler import (
++    EmbeddingPoolerOutput,
++    Pooler,
++    PoolingType,
++    pool_hidden_states,
++)
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
+@@ -63,7 +68,16 @@ class Qwen2ForRewardModel(nn.Module):
+         logits = self.score(hidden_states)
+         pooled_logits = self.pooler(logits, forward_batch).embeddings
+ 
+-        return EmbeddingPoolerOutput(pooled_logits)
++        pooled_hidden = None
++        if forward_batch.return_pooled_hidden_states:
++            pooled_hidden = pool_hidden_states(
++                self.pooler.pooling_type, hidden_states, forward_batch
++            )
++
++        return EmbeddingPoolerOutput(
++            embeddings=pooled_logits,
++            pooled_hidden_states=pooled_hidden,
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         # Filter out lm_head weights of Qwen2ForCausalLM
+diff --git a/python/sglang/srt/models/qwen3_classification.py b/python/sglang/srt/models/qwen3_classification.py
+index f6eff513d..8afc365bc 100644
+--- a/python/sglang/srt/models/qwen3_classification.py
++++ b/python/sglang/srt/models/qwen3_classification.py
+@@ -19,7 +19,12 @@ import torch
+ from torch import nn
+ from transformers import Qwen2Config  # Qwen3 uses Qwen2Config
+ 
+-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
++from sglang.srt.layers.pooler import (
++    EmbeddingPoolerOutput,
++    Pooler,
++    PoolingType,
++    score_and_pool,
++)
+ from sglang.srt.layers.quantization.base_config import QuantizationConfig
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_loader.weight_utils import default_weight_loader
+@@ -62,10 +67,9 @@ class Qwen3ForPooledOutput(nn.Module):
+         assert get_embedding, f"{self.__class__.__name__} is only used for embedding"
+ 
+         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+-        logits = self.score(hidden_states)
+-        pooled_logits = self.pooler(logits, forward_batch).embeddings
+-
+-        return EmbeddingPoolerOutput(pooled_logits)
++        return score_and_pool(
++            self.score, self.pooler, hidden_states, forward_batch, input_ids
++        )
+ 
+     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+         stacked_params_mapping = [
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 9ec274d2a..f6c57ef34 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -784,6 +784,9 @@ class ServerArgs:
+         # Handle piecewise CUDA graph.
+         self._handle_piecewise_cuda_graph()
+ 
++        # Handle multi-item scoring constraints.
++        self._handle_multi_item_scoring()
++
+         # Get GPU memory capacity, which is a common dependency for several configuration steps.
+         gpu_mem = get_device_memory_capacity(self.device)
+ 
+@@ -1165,6 +1168,21 @@ class ServerArgs:
+         if self.attn_cp_size > 1:
+             self.disable_piecewise_cuda_graph = True
+ 
++    def _handle_multi_item_scoring(self):
++        """Disable CUDA graphs when multi-item scoring delimiter is set.
++
++        The padded static input_ids buffer used by CUDA graph replay causes
++        spurious delimiter matches in score_and_pool's MIS path.
++        """
++        if self.multi_item_scoring_delimiter is None:
++            return
++        if not self.disable_cuda_graph:
++            logger.warning(
++                "CUDA graph is disabled because --multi-item-scoring-delimiter is set."
++            )
++            self.disable_cuda_graph = True
++        self.disable_piecewise_cuda_graph = True
++
+     def _handle_gpu_memory_settings(self, gpu_mem):
+         """
+         Configure GPU memory-dependent settings including

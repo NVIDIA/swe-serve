@@ -1,0 +1,2 @@
+test/registered/models/test_qwen35_public_serving.py::test_authentic_checkpoint_loads_through_openai_models_api
+test/registered/models/test_qwen35_moe_public_serving.py::test_authentic_moe_checkpoint_loads_and_routes_top8

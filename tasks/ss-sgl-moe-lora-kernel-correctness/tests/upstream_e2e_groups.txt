@@ -1,0 +1,2 @@
+test/registered/jit/test_moe_lora_align_block_size.py::test_moe_lora_align_block_size
+test/registered/lora/test_fused_moe_lora_kernel.py::test_fused_moe_lora_kernel

@@ -1,0 +1,2 @@
+test/registered/models/test_gemma4_pcg_execution.py::test_eager_public_text_output_ids_and_logprobs_remain_compatible
+test/registered/eval/test_vlms_mmmu_eval.py::TestNightlyVLMMmmuEval::test_mmmu_vlm_models

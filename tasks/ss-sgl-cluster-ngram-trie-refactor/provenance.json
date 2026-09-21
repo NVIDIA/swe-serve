@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl-cluster-ngram-trie-refactor",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/20393"
+  ]
+}

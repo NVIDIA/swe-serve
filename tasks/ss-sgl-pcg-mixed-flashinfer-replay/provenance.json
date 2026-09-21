@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl-pcg-mixed-flashinfer-replay",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/20441"
+  ]
+}

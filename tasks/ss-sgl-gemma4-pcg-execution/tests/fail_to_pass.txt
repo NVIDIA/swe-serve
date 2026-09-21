@@ -1,0 +1,4 @@
+test/registered/models/test_gemma4_pcg_execution.py::test_forced_pcg_captures_authentic_gemma4
+test/registered/models/test_gemma4_pcg_execution.py::test_public_text_replays_with_logprob_parity
+test/registered/models/test_gemma4_pcg_execution.py::test_real_image_serving_preserves_active_pcg
+test/registered/models/test_gemma4_pcg_execution.py::test_repeated_public_prefills_use_forced_pcg

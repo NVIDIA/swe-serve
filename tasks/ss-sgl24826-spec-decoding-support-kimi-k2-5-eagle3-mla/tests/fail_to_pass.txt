@@ -1,0 +1,3 @@
+test/registered/unit/models/test_kimi_k25_eagle3_registry.py::TestEagle3DeepseekV2Registered::test_arch_in_supported_archs
+test/registered/unit/models/test_kimi_k25_eagle3_registry.py::TestEagle3DeepseekV2Registered::test_arch_resolves_to_named_class
+test/registered/unit/models/test_kimi_k25_eagle3_registry.py::TestEagle3DeepseekV2Registered::test_new_deepseek_v3_alias_resolves_through_normal_config_path

@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl-transformers5-moe-core-serving",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/19163"
+  ]
+}

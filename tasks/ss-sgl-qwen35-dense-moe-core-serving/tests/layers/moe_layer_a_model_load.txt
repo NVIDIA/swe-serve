@@ -1,0 +1,1 @@
+test/registered/models/test_qwen35_moe_public_serving.py::test_authentic_moe_checkpoint_loads_and_routes_top8

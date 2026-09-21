@@ -1,0 +1,1 @@
+test/registered/models/test_gemma4_moe_public_serving.py::test_nested_config_registry_and_real_router_contract

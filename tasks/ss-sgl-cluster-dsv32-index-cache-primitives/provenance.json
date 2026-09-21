@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl-cluster-dsv32-index-cache-primitives",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/19148"
+  ]
+}

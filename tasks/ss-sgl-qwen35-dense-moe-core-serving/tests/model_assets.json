@@ -1,0 +1,128 @@
+{
+  "schema_version": 2,
+  "assets": {
+    "dense_native": {
+      "kind": "authentic_public_checkpoint",
+      "repository": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "license": "Apache-2.0",
+      "parameter_count": 873438784,
+      "model_path_env": "QWEN35_NATIVE_MODEL",
+      "config_model_type": "qwen3_5",
+      "config_architecture": "Qwen3_5ForConditionalGeneration",
+      "runtime_files": [
+        "chat_template.jinja",
+        "config.json",
+        "merges.txt",
+        "model.safetensors.index.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json"
+      ],
+      "weight_shards": [
+        {
+          "file": "model.safetensors-00001-of-00001.safetensors",
+          "size_bytes": 1746942600,
+          "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+        }
+      ]
+    },
+    "moe_native": {
+      "kind": "authentic_public_checkpoint",
+      "repository": "Qwen/Qwen3.5-35B-A3B",
+      "revision": "59d61f3ce65a6d9863b86d2e96597125219dc754",
+      "license": "Apache-2.0",
+      "parameter_count": 36000000000,
+      "active_parameter_count": 3000000000,
+      "model_path_env": "QWEN35_MOE_MODEL",
+      "config_model_type": "qwen3_5_moe",
+      "config_architecture": "Qwen3_5MoeForConditionalGeneration",
+      "num_experts": 256,
+      "num_experts_per_token": 8,
+      "runtime_files": [
+        "chat_template.jinja",
+        "config.json",
+        "merges.txt",
+        "model.safetensors.index.json",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "video_preprocessor_config.json",
+        "vocab.json"
+      ],
+      "weight_size_bytes": 71903878016,
+      "weight_shards": [
+        {"file": "model.safetensors-00001-of-00014.safetensors", "size_bytes": 5368709816, "sha256": "1b9f16fdae2411c0c50dbc7a5dacaebd033b28f3fd083e708f53cda3420e7247"},
+        {"file": "model.safetensors-00002-of-00014.safetensors", "size_bytes": 5368709808, "sha256": "79f06bc069d273b37ae7e1ef21eb24d8641ac74227b6139b00af55addf27e9ee"},
+        {"file": "model.safetensors-00003-of-00014.safetensors", "size_bytes": 5368709808, "sha256": "2cb56343806fd845eb2ca3ff5c46b1de409e05dc09d03edb86f7fb2d752b4f3d"},
+        {"file": "model.safetensors-00004-of-00014.safetensors", "size_bytes": 5368709816, "sha256": "39a39c799e52db2ca3d6123dad077b7dbfff3dbad4bcc9cbf66502db7be650a3"},
+        {"file": "model.safetensors-00005-of-00014.safetensors", "size_bytes": 5368709816, "sha256": "1a3b31ebb04bffa60d0ad5d9f2973d476d88959bb842ce003f068a6a9c5d4776"},
+        {"file": "model.safetensors-00006-of-00014.safetensors", "size_bytes": 5368709816, "sha256": "af5f17d292df6b200ee928d7dac30a66eab3e8f6d5d88a84fe1d27859d4a64fe"},
+        {"file": "model.safetensors-00007-of-00014.safetensors", "size_bytes": 5368709808, "sha256": "52885dbecd4e8e2e52e6cd50a1693a640ce622f219c35bf317aad89f72d956fc"},
+        {"file": "model.safetensors-00008-of-00014.safetensors", "size_bytes": 5368709808, "sha256": "43f232ba029dc4ca5ad994e38913c6ff74f110198e005ee2f35e42f9ce438cb3"},
+        {"file": "model.safetensors-00009-of-00014.safetensors", "size_bytes": 5255463936, "sha256": "8fa6a375dd539822b19ad18ad002f8acedd4920ff770bc284cfb428a213c9f17"},
+        {"file": "model.safetensors-00010-of-00014.safetensors", "size_bytes": 5368710456, "sha256": "d89e80aaf84c0b8a442162fc97c38fe7ce85d11ae728f67aa449350da86f8212"},
+        {"file": "model.safetensors-00011-of-00014.safetensors", "size_bytes": 5368710464, "sha256": "5b774025e5ed974256ce40498bfe4e1ad9ae8a4f13f9e9145666d24ea7404cae"},
+        {"file": "model.safetensors-00012-of-00014.safetensors", "size_bytes": 5368710456, "sha256": "d0f0bd7a5f09e6e05aee9a6ef5ba97fe678b0e19b891a81969682b0bdc9bb5c7"},
+        {"file": "model.safetensors-00013-of-00014.safetensors", "size_bytes": 5367839544, "sha256": "da8cc27a2a99eeba5674bfef03c80b3c4f08edfd839ad319a7702fcaedfd874f"},
+        {"file": "model.safetensors-00014-of-00014.safetensors", "size_bytes": 2224764664, "sha256": "d5e08a7dd670d7ef8da38e7af29cb8cdf42ecded5dfb2d9fcaf06cae79dfaa41"}
+      ]
+    }
+  },
+  "common_assets": ["dense_native", "moe_native"],
+  "fixtures": {
+    "solid_green_mp4": {
+      "kind": "embedded_verifier_fixture",
+      "media_type": "video/mp4",
+      "semantic_contract": "two-second solid green H.264 clip, 112x112 at four fps",
+      "embedded_base64_path": "fixtures/solid_green_mp4.b64",
+      "fixture_path_env": "QWEN35_GREEN_VIDEO",
+      "size_bytes": 1810,
+      "sha256": "013cc906ebede5c28133d8fcafba43550576ea914a4b0bb7d4e4a7c3eadbe2f5"
+    },
+    "man_ironing_on_back_of_suv_png": {
+      "kind": "packaged_verifier_fixture",
+      "repository": "sgl-project/sgl-test-files",
+      "revision": "676adca0d76ab4d945cab4686ca6a5529ee8f775",
+      "path": "images/man_ironing_on_back_of_suv.png",
+      "packaged_path": "fixtures/man_ironing_on_back_of_suv.png",
+      "fixture_path_env": "QWEN35_VLM_IMAGE_MAN_IRONING",
+      "media_type": "image/png",
+      "size_bytes": 57365,
+      "sha256": "e06917184a00b14abd70cd8ea0ff5dca9abfbbad29f7b25c02f97133d4cd060e"
+    },
+    "sgl_logo_png": {
+      "kind": "packaged_verifier_fixture",
+      "repository": "sgl-project/sgl-test-files",
+      "revision": "676adca0d76ab4d945cab4686ca6a5529ee8f775",
+      "path": "images/sgl_logo.png",
+      "packaged_path": "fixtures/sgl_logo.png",
+      "fixture_path_env": "QWEN35_VLM_IMAGE_SGL_LOGO",
+      "media_type": "image/png",
+      "size_bytes": 402692,
+      "sha256": "4af0b4cbf4fe9479c1fc3675e025f2752b67bd9a7c15a0003af11110c6ee4165"
+    }
+  },
+  "profiles": {
+    "h100_1": {
+      "gpu_family": "hopper",
+      "gpu_name_contains": "H100",
+      "allocation_gpus": 1,
+      "tp_size": 1,
+      "primary_assets": ["dense_native", "moe_native"],
+      "dense_server_args": [],
+      "moe_server_args": ["--quantization", "fp8"]
+    },
+    "gb300_1": {
+      "gpu_family": "blackwell",
+      "gpu_name_contains": "GB300",
+      "allocation_gpus": 1,
+      "tp_size": 1,
+      "primary_assets": ["dense_native", "moe_native"],
+      "dense_server_args": [],
+      "moe_server_args": []
+    }
+  }
+}

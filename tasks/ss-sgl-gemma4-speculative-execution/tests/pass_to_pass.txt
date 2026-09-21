@@ -1,0 +1,1 @@
+test/registered/unit/test_speculative_registry_compatibility.py::test_existing_dflash_algorithm_registry_contract

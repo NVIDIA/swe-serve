@@ -1,0 +1,1575 @@
+diff --git a/python/sglang/srt/dllm/algorithm/joint_threshold.py b/python/sglang/srt/dllm/algorithm/joint_threshold.py
+new file mode 100644
+index 000000000..a1feef25d
+--- /dev/null
++++ b/python/sglang/srt/dllm/algorithm/joint_threshold.py
+@@ -0,0 +1,146 @@
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++from sglang.srt.dllm.algorithm.base import DllmAlgorithm
++from sglang.srt.dllm.config import DllmConfig
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++from sglang.srt.model_executor.model_runner import ModelRunner
++
++
++class JointThreshold(DllmAlgorithm):
++
++    @staticmethod
++    def _unpack_forward_result(out):
++        if isinstance(out, tuple):
++            return out
++        return out.logits_output, out.can_run_graph
++
++    def __init__(
++        self,
++        config: DllmConfig,
++    ):
++        super().__init__(config)
++        self.threshold = config.algorithm_config.get("threshold", 0.5)
++        self.edit_threshold = config.algorithm_config.get("edit_threshold", 0)
++        self.max_post_edit_steps = config.algorithm_config.get(
++            "max_post_edit_steps", 16
++        )
++        self.penalty_lambda = config.algorithm_config.get("penalty_lambda", 0)
++
++    def run(
++        self,
++        model_runner: ModelRunner,
++        forward_batch: ForwardBatch,
++    ) -> tuple[LogitsProcessorOutput | torch.Tensor, torch.Tensor | None, bool]:
++        batch_size = forward_batch.batch_size
++        device = forward_batch.input_ids.device
++
++        mask_index = forward_batch.input_ids == self.mask_id
++        if not mask_index.any():
++            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++            logits_output, can_run_cuda_graph = self._unpack_forward_result(out)
++            return logits_output, [], can_run_cuda_graph
++
++        start_list = []
++        prompt_masks = []
++        for i in range(batch_size):
++            block_start = i * self.block_size
++            block_end = block_start + self.block_size
++            block_input_ids = forward_batch.input_ids[block_start:block_end]
++
++            prompt_mask = block_input_ids != self.mask_id
++            prompt_masks.append(prompt_mask)
++            start_list.append(prompt_mask.sum().item())
++
++        post_edit_steps = torch.zeros(batch_size, dtype=torch.int32, device=device)
++
++        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
++        # Controls whether to perform an additional forward pass for KV cache persistence.
++        # For certain decoding rounds where the terminal step yields no state change,
++        # this can be set to False to bypass the overhead of an idle forward pass.
++        any_changed_in_last_step = False
++
++        max_iterations = self.block_size + self.max_post_edit_steps
++        for _ in range(max_iterations):
++            if finished.all():
++                break
++
++            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++            logits_output, can_run_cuda_graph = self._unpack_forward_result(out)
++
++            any_changed_in_last_step = False
++
++            for i in range(batch_size):
++                if finished[i]:
++                    continue
++
++                block_start = i * self.block_size
++                block_end = block_start + self.block_size
++
++                curr_input_ids = forward_batch.input_ids[block_start:block_end]
++                curr_logits = logits_output.full_logits[block_start:block_end]
++                curr_prompt_mask = prompt_masks[i]
++
++                if self.penalty_lambda > 0:
++                    prev_ids = curr_input_ids[:-1]
++                    curr_logits[1:, :].scatter_(
++                        1, prev_ids.unsqueeze(-1), -self.penalty_lambda, reduce="add"
++                    )
++
++                x = torch.argmax(curr_logits, dim=-1)
++                p = torch.squeeze(
++                    torch.gather(
++                        F.softmax(curr_logits, dim=-1),
++                        dim=-1,
++                        index=torch.unsqueeze(x, -1),
++                    ),
++                    -1,
++                )
++
++                mask_index = curr_input_ids == self.mask_id
++                has_mask = mask_index.any()
++
++                # Mask to token (M2T)
++                mask_transfer_index = torch.zeros_like(mask_index)
++                if has_mask:
++                    confidence = torch.where(mask_index, p, -np.inf)
++                    mask_transfer_index = confidence > self.threshold
++
++                    if not mask_transfer_index.any():
++                        _, select_index = torch.topk(confidence, k=1)
++                        mask_transfer_index[select_index] = True
++                else:
++                    post_edit_steps[i] += 1
++                    if post_edit_steps[i] > self.max_post_edit_steps:
++                        finished[i] = True
++                        continue
++
++                # Token to token (T2T)
++                edit_mask = ~mask_index & ~curr_prompt_mask
++                edit_transfer_index = (
++                    (p > self.edit_threshold) & (curr_input_ids != x) & edit_mask
++                )
++
++                transfer_index = mask_transfer_index | edit_transfer_index
++                if not transfer_index.any():
++                    finished[i] = True
++                    continue
++
++                curr_input_ids[transfer_index] = x[transfer_index]
++                any_changed_in_last_step = True
++
++        if any_changed_in_last_step:
++            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++            logits_output, can_run_cuda_graph = self._unpack_forward_result(out)
++
++        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
++        next_token_ids_list = [
++            next_token_ids[i, start_list[i] :] for i in range(batch_size)
++        ]
++
++        return logits_output, next_token_ids_list, can_run_cuda_graph
++
++
++Algorithm = JointThreshold
+diff --git a/python/sglang/srt/dllm/algorithm/low_confidence.py b/python/sglang/srt/dllm/algorithm/low_confidence.py
+index 20e73d3b5..61be2bb30 100644
+--- a/python/sglang/srt/dllm/algorithm/low_confidence.py
++++ b/python/sglang/srt/dllm/algorithm/low_confidence.py
+@@ -1,10 +1,11 @@
+-from typing import Optional, Tuple, Union
++from typing import List, Tuple, Union
+ 
+ import numpy as np
+ import torch
+ import torch.nn.functional as F
+ 
+ from sglang.srt.dllm.algorithm.base import DllmAlgorithm
++from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+ from sglang.srt.model_executor.model_runner import ModelRunner
+@@ -12,48 +13,101 @@ from sglang.srt.model_executor.model_runner import ModelRunner
+ 
+ class LowConfidence(DllmAlgorithm):
+ 
++    def __init__(
++        self,
++        config: DllmConfig,
++    ):
++        super().__init__(config)
++        self.threshold = config.algorithm_config.get("threshold", 0.95)
++
+     def run(
+         self,
+         model_runner: ModelRunner,
+         forward_batch: ForwardBatch,
+-    ) -> Tuple[
+-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
+-    ]:
++    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
++        batch_size = forward_batch.batch_size
++        # Here, the forward_batch full logits contains all the blocks
++        # such as [dllm_block_size * batch_size, hidden_size]
++        start_list = []
+         mask_index = forward_batch.input_ids == self.mask_id
+-        start = len(forward_batch.input_ids) - torch.sum(mask_index).item()
++
++        # Fast path: if there is no mask token, forward and save kv cache
++        if torch.sum(mask_index).item() == 0:
++            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++            if isinstance(out, tuple):
++                logits_output, can_run_cuda_graph = out
++            else:
++                logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
++
++            next_token_ids = []
++            return logits_output, next_token_ids, can_run_cuda_graph
++
++        # Calculate start positions for each block
++        for block_id in range(batch_size):
++            block_start = block_id * self.block_size
++            block_end = block_start + self.block_size
++            block_input_ids = forward_batch.input_ids[block_start:block_end]
++            block_mask_index = block_input_ids == self.mask_id
++            start = self.block_size - torch.sum(block_mask_index).item()
++            start_list.append(start)
+ 
+         for _ in range(self.block_size):
+             mask_index = forward_batch.input_ids == self.mask_id
+             if torch.sum(mask_index).item() == 0:
+                 break
+ 
+-            logits_output, can_run_cuda_graph = model_runner.forward(
+-                forward_batch, pp_proxy_tensors=None
+-            )
+-
+-            x = torch.argmax(logits_output.full_logits, dim=-1)
+-            p = torch.squeeze(
+-                torch.gather(
+-                    F.softmax(logits_output.full_logits, dim=-1),
+-                    dim=-1,
+-                    index=torch.unsqueeze(x, -1),
+-                ),
+-                -1,
+-            )
+-            x = torch.where(mask_index, x, forward_batch.input_ids)
+-            confidence = torch.where(mask_index, p, -np.inf)
+-            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=x.device)
+-            _, select_index = torch.topk(confidence, k=1)
+-            transfer_index[select_index] = True
+-
+-            forward_batch.input_ids[transfer_index] = x[transfer_index]
+-
+-        logits_output, can_run_cuda_graph = model_runner.forward(
+-            forward_batch, pp_proxy_tensors=None
+-        )
+-
+-        next_token_ids = forward_batch.input_ids[start:]
+-        return logits_output, next_token_ids, can_run_cuda_graph
++            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++            if isinstance(out, tuple):
++                logits_output, can_run_cuda_graph = out
++            else:
++                logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
++            assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
++            for batch_id in range(batch_size):
++                curr_block_start = batch_id * self.block_size
++                curr_block_end = curr_block_start + self.block_size
++                block_input_ids = forward_batch.input_ids[
++                    curr_block_start:curr_block_end,
++                ]
++                block_mask_index = block_input_ids == self.mask_id
++                if torch.sum(block_mask_index).item() == 0:
++                    continue
++                curr_logits = logits_output.full_logits[
++                    curr_block_start:curr_block_end,
++                ]
++
++                x = torch.argmax(curr_logits, dim=-1)
++                p = torch.squeeze(
++                    torch.gather(
++                        F.softmax(curr_logits, dim=-1),
++                        dim=-1,
++                        index=torch.unsqueeze(x, -1),
++                    ),
++                    -1,
++                )
++                x = torch.where(block_mask_index, x, block_input_ids)
++                confidence = torch.where(block_mask_index, p, -np.inf)
++
++                transfer_index = confidence > self.threshold
++
++                if transfer_index.sum().item() == 0:
++                    _, select_index = torch.topk(confidence, k=1)
++                    transfer_index[select_index] = True
++
++                block_input_ids[transfer_index] = x[transfer_index]
++
++        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
++        if isinstance(out, tuple):
++            logits_output, can_run_cuda_graph = out
++        else:
++            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
++        # Here next token ids is tricky to implement the dynamic lengths,
++        # so we return a list of tensors
++        next_token_ids = torch.reshape(forward_batch.input_ids, (batch_size, -1))
++        next_token_ids_list = [
++            next_token_ids[i, start_list[i] :] for i in range(batch_size)
++        ]
++
++        return logits_output, next_token_ids_list, can_run_cuda_graph
+ 
+ 
+ Algorithm = LowConfidence
+diff --git a/python/sglang/srt/dllm/config.py b/python/sglang/srt/dllm/config.py
+index 3c00de5fb..8f46f924d 100644
+--- a/python/sglang/srt/dllm/config.py
++++ b/python/sglang/srt/dllm/config.py
+@@ -1,3 +1,5 @@
++from typing import Any
++
+ from sglang.srt.configs.model_config import ModelConfig
+ from sglang.srt.server_args import ServerArgs
+ 
+@@ -5,13 +7,17 @@ from sglang.srt.server_args import ServerArgs
+ class DllmConfig:
+     def __init__(
+         self,
+-        mask_id: int,
+-        block_size: int,
+         algorithm: str,
++        algorithm_config: dict[str, Any],
++        block_size: int,
++        mask_id: int,
++        max_running_requests: int,
+     ):
+         self.algorithm = algorithm
++        self.algorithm_config = algorithm_config
+         self.block_size = block_size
+         self.mask_id = mask_id
++        self.max_running_requests = max_running_requests
+ 
+     @staticmethod
+     def from_server_args(
+@@ -20,21 +26,52 @@ class DllmConfig:
+         if server_args.dllm_algorithm is None:
+             return None
+ 
+-        config = ModelConfig.from_server_args(
++        model_config = ModelConfig.from_server_args(
+             server_args,
+             model_path=server_args.model_path,
+             model_revision=server_args.revision,
+         )
++        DLLM_PARAMS = {
++            "LLaDA2MoeModelLM": {"block_size": 32, "mask_id": 156895},
++        }
+ 
+-        if config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
+-            mask_id = 156895
++        arch = model_config.hf_config.architectures[0]
++        if arch in DLLM_PARAMS:
++            params = DLLM_PARAMS[arch]
++            block_size = params["block_size"]
++            mask_id = params["mask_id"]
+         else:
+-            raise RuntimeError(
+-                f"Unknown diffusion LLM: {config.hf_config.architectures[0]}"
+-            )
++            raise RuntimeError(f"Unknown diffusion LLM: {arch}")
++
++        max_running_requests = (
++            1
++            if server_args.max_running_requests is None
++            else server_args.max_running_requests
++        )
++
++        algorithm = server_args.dllm_algorithm
++        algorithm_config = {}
++        if server_args.dllm_algorithm_config is not None:
++            try:
++                import yaml
++            except ImportError:
++                raise ImportError(
++                    "Please install PyYAML to use YAML config files. "
++                    "`pip install pyyaml`"
++                )
++            with open(server_args.dllm_algorithm_config, "r") as f:
++                algorithm_config = yaml.safe_load(f) or {}
++
++            if not isinstance(algorithm_config, dict):
++                raise TypeError("Diffusion algorithm YAML must contain a mapping")
++
++            # Parse common algorithm configurations
++            block_size = algorithm_config.get("block_size", block_size)
+ 
+         return DllmConfig(
+-            algorithm=server_args.dllm_algorithm,
+-            block_size=server_args.dllm_block_size,
++            algorithm=algorithm,
++            algorithm_config=algorithm_config,
++            block_size=block_size,
+             mask_id=mask_id,
++            max_running_requests=max_running_requests,
+         )
+diff --git a/python/sglang/srt/dllm/mixin/req.py b/python/sglang/srt/dllm/mixin/req.py
+new file mode 100644
+index 000000000..720b9d1db
+--- /dev/null
++++ b/python/sglang/srt/dllm/mixin/req.py
+@@ -0,0 +1,74 @@
++from __future__ import annotations
++
++import enum
++from typing import TYPE_CHECKING, Optional
++
++from sglang.srt.dllm.config import DllmConfig
++
++if TYPE_CHECKING:
++    from sglang.srt.managers.schedule_batch import Req
++
++
++class DllmReqPhase(str, enum.Enum):
++    STAGING_PREFILL = "staging_prefill"
++    STAGING_DECODE = "staging_decode"
++    INCOMING_PREFILL = "incoming_prefill"
++    INCOMING_DECODE = "incoming_decode"
++
++
++class ReqDllmMixin:
++    def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
++        self.dllm_phase: Optional[DllmReqPhase] = None
++        self.dllm_block_offset = 0
++        self.dllm_config = dllm_config
++
++        if self.dllm_config is not None:
++            if len(self.origin_input_ids) < self.dllm_config.block_size:
++                self.dllm_phase = DllmReqPhase.INCOMING_DECODE
++            else:
++                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
++
++    def is_dllm(self: Req) -> bool:
++        return self.dllm_config is not None
++
++    def is_dllm_prefill(self: Req) -> bool:
++        return self.dllm_phase in [
++            DllmReqPhase.STAGING_PREFILL,
++            DllmReqPhase.INCOMING_PREFILL,
++        ]
++
++    def determine_dllm_phase(self: Req):
++        prefix_length = len(self.prefix_indices)
++        min_required_length = prefix_length + self.dllm_config.block_size
++
++        if len(self.fill_ids) < min_required_length:
++            # still incoming stage
++            return
++
++        input_block = self.fill_ids[prefix_length:min_required_length]
++        is_prefill_phase = self.dllm_config.mask_id not in input_block
++
++        if is_prefill_phase:
++            self.dllm_phase = DllmReqPhase.STAGING_PREFILL
++        else:
++            self.dllm_phase = DllmReqPhase.STAGING_DECODE
++
++    def _init_fill_ids_for_dllm(self: Req):
++        self.dllm_block_offset = (
++            0
++            if not self.fill_ids
++            else self.dllm_block_offset + self.dllm_config.block_size
++        )
++        self.fill_ids = (
++            self.origin_input_ids
++            + self.output_ids
++            + [self.dllm_config.mask_id] * self.dllm_config.block_size
++        )
++
++    def _update_block_offset_for_dllm(self):
++        prefix_len = len(self.prefix_indices)
++        assert (
++            prefix_len % self.dllm_config.block_size == 0
++        ), f"Unexpected prefix len: {prefix_len}"
++        if prefix_len > self.dllm_block_offset:
++            self.dllm_block_offset = prefix_len
+diff --git a/python/sglang/srt/dllm/mixin/scheduler.py b/python/sglang/srt/dllm/mixin/scheduler.py
+new file mode 100644
+index 000000000..184446b9a
+--- /dev/null
++++ b/python/sglang/srt/dllm/mixin/scheduler.py
+@@ -0,0 +1,349 @@
++from __future__ import annotations
++
++import logging
++import time
++from typing import TYPE_CHECKING, List, Optional, Set, Union
++
++from sglang.srt.dllm.config import DllmConfig
++from sglang.srt.dllm.mixin.req import DllmReqPhase
++from sglang.srt.managers.schedule_batch import Req, RequestStage, ScheduleBatch
++from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
++from sglang.srt.mem_cache.common import release_kv_cache
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
++
++logger = logging.getLogger(__name__)
++
++if TYPE_CHECKING:
++    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
++
++
++class SchedulerDllmMixin:
++    def init_diffusion_llm(self: Scheduler):
++        self.dllm_config = (
++            DllmConfig.from_server_args(self.server_args)
++            if self.server_args.dllm_algorithm is not None
++            else None
++        )
++        self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
++
++    def stash_chunked_request(self: Scheduler, req: Req):
++        self.tree_cache.cache_unfinished_req(req, chunked=True)
++        self.req_to_token_pool.free(req.req_pool_idx)
++
++    def get_new_batch_dllm(self: Scheduler) -> Optional[ScheduleBatch]:
++        """Generate a new batch for DLLM (Diffusion LLM) scheduling."""
++        if self.try_preemption:
++            self.running_batch.batch_is_full = False
++
++        # Early exit if batch is full or no requests available
++        if self._should_skip_prefill():
++            return None
++
++        running_bs = len(self.running_batch.reqs)
++        self.policy.calc_priority(self.waiting_queue)
++
++        # Create prefill adder with resource constraints
++        adder = self._create_dllm_prefill_adder(running_bs)
++
++        # Initialize DLLM manager and transfer requests
++        self.dllm_manager.init_next_round()
++        self._fetch_waiting_reqs()
++
++        # Process batches
++        forward_mode = self._process_dllm_batches(adder)
++
++        can_run_list = adder.can_run_list
++        if not can_run_list:
++            return None
++
++        # Record metrics and update state
++        self._update_metrics_and_state_for_batch(can_run_list, adder, running_bs)
++
++        # Create and prepare batch
++        new_batch = self._create_dllm_batch(can_run_list, forward_mode)
++        return new_batch
++
++    def process_batch_result_dllm(
++        self: Scheduler,
++        batch: ScheduleBatch,
++        result: GenerationBatchResult,
++    ):
++        if result.copy_done is not None:
++            result.copy_done.synchronize()
++
++        if result.next_token_ids:
++            self.token_to_kv_pool_allocator.free_group_begin()
++
++            for idx in range(batch.batch_size()):
++                req = batch.reqs[idx]
++
++                next_token_ids = result.next_token_ids[idx].tolist()
++                new_tokens = len(next_token_ids)
++                if new_tokens == 0:
++                    continue
++
++                req.fill_ids[-new_tokens:] = next_token_ids[:]
++                self.num_generated_tokens += new_tokens
++
++                req.output_ids.extend(next_token_ids)
++                req.check_finished(new_accepted_len=new_tokens)
++
++                if req.finished():
++                    release_kv_cache(req, self.tree_cache)
++                    req.time_stats.completion_time = time.perf_counter()
++
++            self.stream_output(batch.reqs, batch.return_logprob)
++            self.token_to_kv_pool_allocator.free_group_end()
++
++    def _fetch_waiting_reqs(self: Scheduler):
++        # Calculate how many requests can be added to DLLM manager
++        max_dllm_capacity = self.dllm_config.max_running_requests - len(
++            self.dllm_manager.waiting_queue
++        )
++        num_requests_to_add = min(max_dllm_capacity, len(self.waiting_queue))
++
++        if num_requests_to_add > 0:
++            requests_to_add = self.waiting_queue[:num_requests_to_add]
++            self.dllm_manager.add_waiting_reqs(requests_to_add)
++            self.waiting_queue = self.waiting_queue[num_requests_to_add:]
++
++    def _should_skip_prefill(self: Scheduler) -> bool:
++        """Check if DLLM prefill should be skipped."""
++        if (
++            self.running_batch.batch_is_full or not self.waiting_queue
++        ) and self.dllm_manager.is_empty():
++            return True
++
++        running_bs = len(self.running_batch.reqs)
++        if (
++            self.get_num_allocatable_reqs(running_bs) <= 0
++            and self.dllm_manager.is_empty()
++            and not self.try_preemption
++        ):
++            self.running_batch.batch_is_full = True
++            return True
++
++        return False
++
++    def _create_dllm_prefill_adder(self: Scheduler, running_bs: int) -> PrefillAdder:
++        """Create a prefill adder configured for DLLM scheduling."""
++        return PrefillAdder(
++            self.page_size,
++            self.tree_cache,
++            self.token_to_kv_pool_allocator,
++            self.running_batch,
++            self.new_token_ratio,
++            self.max_prefill_tokens,
++            self.chunked_prefill_size,
++            running_bs if self.is_mixed_chunk else 0,
++            self.priority_scheduling_preemption_threshold,
++            dllm_config=self.dllm_config,
++        )
++
++    def _process_dllm_batches(self: Scheduler, adder: PrefillAdder) -> ForwardMode:
++        """Process prefill or decode batches for DLLM."""
++        forward_mode = ForwardMode.DLLM_EXTEND
++
++        # Try prefill batch first
++        prefill_reqs = self.dllm_manager.get_prefill_requests()
++        if prefill_reqs:
++            self._process_batch_by_phase(
++                adder,
++                prefill_reqs,
++                DllmReqPhase.STAGING_PREFILL,
++                DllmReqPhase.INCOMING_PREFILL,
++            )
++        else:
++            # Fall back to decode batch
++            decode_reqs = self.dllm_manager.get_decode_requests()
++            self._process_batch_by_phase(
++                adder,
++                decode_reqs,
++                DllmReqPhase.STAGING_DECODE,
++                DllmReqPhase.INCOMING_DECODE,
++            )
++
++        return forward_mode
++
++    def _process_batch_by_phase(
++        self,
++        adder: PrefillAdder,
++        batch: List[Req],
++        staging_phase: DllmReqPhase,
++        incoming_phase: DllmReqPhase,
++    ) -> None:
++        """Process a batch, separating staging and incoming requests."""
++        staging_reqs = [req for req in batch if req.dllm_phase == staging_phase]
++        if staging_reqs:
++            staging_result = self.process_dllm_staging_reqs(adder, staging_reqs)
++            if staging_result != AddReqResult.CONTINUE:
++                return
++
++        incoming_reqs = [req for req in batch if req.dllm_phase == incoming_phase]
++        if incoming_reqs:
++            self.process_dllm_incoming_reqs(adder, incoming_reqs)
++
++    def _update_metrics_and_state_for_batch(
++        self: Scheduler, can_run_list: List[Req], adder: PrefillAdder, running_bs: int
++    ) -> None:
++        """Update metrics and state for the batch."""
++        if self.enable_metrics:
++            for req in can_run_list:
++                req.add_latency(RequestStage.PREFILL_WAITING)
++
++        if adder.preempt_list:
++            for req in adder.preempt_list:
++                self._add_request_to_queue(req)
++
++        if can_run_list:
++            self.dllm_manager.add_staging_reqs(can_run_list)
++            self.dllm_manager.increment_chunked_count()
++
++        self.adder = adder
++        self.can_run_list = can_run_list
++        self.running_bs = len(self.running_batch.reqs)
++
++        for req in can_run_list:
++            if req.time_stats.forward_entry_time == 0:
++                req.time_stats.forward_entry_time = time.perf_counter()
++                if self.enable_metrics:
++                    self.metrics_collector.observe_queue_time(
++                        req.time_stats.get_queueing_time(),
++                    )
++
++    def _create_dllm_batch(
++        self: Scheduler, can_run_list: List[Req], forward_mode: ForwardMode
++    ) -> ScheduleBatch:
++        """Create and prepare a new DLLM batch."""
++        new_batch = ScheduleBatch.init_new(
++            can_run_list,
++            self.req_to_token_pool,
++            self.token_to_kv_pool_allocator,
++            self.tree_cache,
++            self.model_config,
++            self.enable_overlap,
++            self.spec_algorithm,
++            dllm_config=self.dllm_config,
++        )
++        new_batch.prepare_for_extend()
++        new_batch.forward_mode = forward_mode
++        new_batch.decoding_reqs = None
++        return new_batch
++
++    def process_dllm_incoming_reqs(
++        self: Scheduler, adder: PrefillAdder, reqs: List[Req]
++    ) -> AddReqResult:
++        """Process incoming DLLM requests with resource allocation and preemption."""
++        res = AddReqResult.CONTINUE
++        for req in reqs:
++            # Check if batch is full
++            running_bs = len(self.running_batch.reqs)
++            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
++                self.running_batch.batch_is_full = True
++
++            # Try preemption if batch is full
++            if self.running_batch.batch_is_full:
++                if not self.try_preemption or not adder.preempt_to_schedule(
++                    req, self.server_args
++                ):
++                    break
++
++            # Prepare and add request
++            req.init_next_round_input(self.tree_cache)
++            res = adder.add_one_req(
++                req,
++                has_chunked_req=True,
++                truncation_align_size=self.truncation_align_size,
++            )
++
++            if res != AddReqResult.CONTINUE:
++                if res == AddReqResult.NO_TOKEN:
++                    self.running_batch.batch_is_full = True
++                break
++
++        return res
++
++    def process_dllm_staging_reqs(
++        self: Scheduler, adder: PrefillAdder, reqs: List[Req]
++    ) -> AddReqResult:
++        """Process staging DLLM requests with resource allocation."""
++        for req in reqs:
++            res = adder.add_dllm_staging_req(req)
++            if res == AddReqResult.NO_TOKEN:
++                return res
++
++        return AddReqResult.CONTINUE
++
++
++class DllmManager:
++    """
++    Manager for Diffusion LLM request scheduling.
++
++    Maintains two queues:
++    - waiting_queue: The requests waiting to be scheduled with max running requests limit
++    - staging_queue: Requests allocated resources by PrefillAdder
++    """
++
++    def __init__(self, dllm_config: Optional[DllmConfig] = None):
++        self.dllm_config = dllm_config
++        self.max_running_reqs = (
++            dllm_config.max_running_requests if dllm_config is not None else 1
++        )
++        self.waiting_queue: List[Req] = []
++        self.staging_queue: List[Req] = []
++
++    def get_prefill_requests(self) -> List[Req]:
++        """Get all prefill requests from waiting queue."""
++        return [req for req in self.waiting_queue if req.is_dllm_prefill()]
++
++    def get_decode_requests(self) -> List[Req]:
++        """Get all decode requests from waiting queue."""
++        return [req for req in self.waiting_queue if not req.is_dllm_prefill()]
++
++    def add_waiting_reqs(self, reqs: Union[Req, List[Req]]) -> None:
++        """Add requests to waiting queue with redundancy check."""
++        assert self.dllm_config is not None, "Diffusion LLM config is not set."
++
++        reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
++
++        # Check for duplicate request IDs
++        if self._has_duplicate_reqs(reqs_to_add):
++            raise RuntimeError("Redundant requests detected in dLLM requests.")
++
++        self.waiting_queue.extend(reqs_to_add)
++
++    def add_staging_reqs(self, reqs: Union[Req, List[Req]]) -> None:
++        """Add requests to staging queue (allocated by PrefillAdder)."""
++        reqs_to_add = reqs if isinstance(reqs, list) else [reqs]
++        self.staging_queue.extend(reqs_to_add)
++
++    def _has_duplicate_reqs(self, reqs: List[Req]) -> bool:
++        """Check if any request ID already exists in waiting queue."""
++        existing_rids: Set[str] = {r.rid for r in self.waiting_queue}
++        return any(req.rid in existing_rids for req in reqs)
++
++    def any_staging_reqs(self) -> bool:
++        """Check if there are requests in staging queue."""
++        return self.dllm_config is not None and len(self.staging_queue) > 0
++
++    def is_empty(self) -> bool:
++        """Check if both queues are empty or DLLM is not configured."""
++        if self.dllm_config is None:
++            return True
++        return len(self.waiting_queue) == 0
++
++    def increment_chunked_count(self) -> None:
++        """Increment chunked count for all staging requests."""
++        for req in self.staging_queue:
++            req.is_chunked += 1
++
++    def filter_finished_reqs(self) -> None:
++        """Remove finished requests from both queues."""
++        self.waiting_queue = [req for req in self.waiting_queue if not req.finished()]
++        self.staging_queue = [req for req in self.staging_queue if not req.finished()]
++
++    def init_next_round(self) -> None:
++        """Initialize staging requests for next round and clear staging queue."""
++        for req in self.staging_queue:
++            req.init_next_round_input()
++        self.staging_queue = []
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index ecebcf76d..e1c0375cf 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
+ 
+ import torch
+ 
++from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+@@ -126,7 +127,9 @@ class FlashInferAttnBackend(AttentionBackend):
+             model_runner.server_args.multi_item_scoring_delimiter
+         )
+ 
+-        self.is_dllm_model = model_runner.server_args.dllm_algorithm is not None
++        # FIXME: remove dllm workarounds from flashinfer
++        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
++        self.is_dllm_model = self.dllm_config is not None
+ 
+         # Parse constants
+         self.decode_use_tensor_cores = should_use_tensor_core(
+@@ -639,6 +642,35 @@ class FlashInferAttnBackend(AttentionBackend):
+             )
+             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
++        elif forward_mode.is_dllm_extend():
++            prefill_wrappers = []
++            for i in range(self.num_wrappers):
++                prefill_wrappers.append(
++                    BatchPrefillWithPagedKVCacheWrapper(
++                        self.workspace_buffer,
++                        "NHD",
++                        backend="fa2",
++                        use_cuda_graph=True,
++                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
++                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
++                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
++                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
++                    )
++                )
++            seq_lens_sum = seq_lens.sum().item()
++            self.indices_updater_prefill.update(
++                req_pool_indices,
++                seq_lens,
++                seq_lens.cpu(),  # may add a little overhead in capture stage
++                seq_lens_sum,
++                prefix_lens=seq_lens - self.dllm_config.block_size,
++                prefill_wrappers=prefill_wrappers,
++                use_ragged=True,
++                encoder_lens=encoder_lens,
++                spec_info=None,
++            )
++            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
++            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+         else:
+             raise ValueError(f"Invalid mode: {forward_mode=}")
+ 
+@@ -689,6 +721,18 @@ class FlashInferAttnBackend(AttentionBackend):
+                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                 spec_info=spec_info,
+             )
++        elif forward_mode.is_dllm_extend():
++            self.indices_updater_prefill.update(
++                req_pool_indices[:bs],
++                seq_lens[:bs],
++                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
++                seq_lens_sum,
++                prefix_lens=seq_lens - self.dllm_config.block_size,
++                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
++                use_ragged=True,
++                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
++                spec_info=None,
++            )
+         else:
+             raise ValueError("Invalid forward mode")
+ 
+@@ -755,7 +799,7 @@ class FlashInferAttnBackend(AttentionBackend):
+                 or layer.attn_type == AttentionType.ENCODER_ONLY
+             ):
+                 causal = False
+-            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
++            if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
+                 save_kv_cache = False
+ 
+             if self.forward_metadata.extend_no_prefix:
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+index 522865765..67adcd572 100644
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -392,6 +392,14 @@ class LogitsProcessor(nn.Module):
+                 input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
+             )
+ 
++        if logits_metadata.forward_mode.is_dllm_extend():
++            assert self.return_full_logits
++            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
++            return LogitsProcessorOutput(
++                full_logits=full_logits,
++                next_token_logits=None,
++            )
++
+         # Get the last hidden states and last logits for the next token prediction
+         if (
+             logits_metadata.forward_mode.is_decode_or_idle()
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+index c4c5a9ebb..13d2e1541 100644
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+ )
+ from sglang.srt.disaggregation.utils import DisaggregationMode
+ from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
++from sglang.srt.dllm.mixin.req import ReqDllmMixin
+ from sglang.srt.environ import envs
+ from sglang.srt.mem_cache.allocator import (
+     BaseTokenToKVPoolAllocator,
+@@ -429,7 +430,7 @@ class RequestStage(str, enum.Enum):
+     DECODE_QUICK_FINISH = "quick_finish"
+ 
+ 
+-class Req:
++class Req(ReqDllmMixin):
+     """The input and output status of a request."""
+ 
+     def __init__(
+@@ -683,9 +684,7 @@ class Req:
+         self.dimensions = dimensions
+ 
+         # For diffusion LLM
+-        self.dllm_ids = []
+-        self.dllm_block_offset = 0
+-        self.dllm_config = dllm_config
++        self.init_diffusion_llm(dllm_config)
+ 
+     @property
+     def seqlen(self) -> int:
+@@ -756,25 +755,10 @@ class Req:
+         # Whether request reached finished condition
+         return self.finished_reason is not None
+ 
+-    def is_dllm(self):
+-        return self.dllm_config is not None
+-
+     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+         if self.is_dllm():
+-            if not self.fill_ids:
+-                self.dllm_ids = (
+-                    self.origin_input_ids
+-                    + [
+-                        self.dllm_config.mask_id,
+-                    ]
+-                    * self.dllm_config.block_size
+-                )
+-            else:
+-                self.dllm_block_offset += self.dllm_config.block_size
+-                self.dllm_ids += [
+-                    self.dllm_config.mask_id
+-                ] * self.dllm_config.block_size
+-            self.fill_ids = self.dllm_ids
++            self._init_fill_ids_for_dllm()
++            self.determine_dllm_phase()
+         else:
+             self.fill_ids = self.origin_input_ids + self.output_ids
+ 
+@@ -808,6 +792,9 @@ class Req:
+             )
+             self.cache_protected_len = len(self.prefix_indices)
+ 
++            if self.is_dllm():
++                self._update_block_offset_for_dllm()
++
+         if (
+             self.is_retracted
+             and self.multimodal_inputs is not None
+@@ -1295,7 +1282,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+ 
+     def prepare_for_extend(self):
+-        self.forward_mode = ForwardMode.EXTEND
++        self.forward_mode = (
++            ForwardMode.DLLM_EXTEND if self.is_dllm() else ForwardMode.EXTEND
++        )
+ 
+         # Init tensors
+         reqs = self.reqs
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index d6d1172e2..4455c89f5 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+ 
+ import torch
+ 
++from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+ from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+@@ -329,6 +330,7 @@ class PrefillAdder:
+         rem_chunk_tokens: Optional[int],
+         mixed_with_decode_tokens: int = 0,
+         priority_scheduling_preemption_threshold: int = 0,
++        dllm_config: Optional[DllmConfig] = None,
+     ):
+         self.page_size = page_size
+         self.tree_cache = tree_cache
+@@ -337,6 +339,11 @@ class PrefillAdder:
+         self.new_token_ratio = new_token_ratio
+         self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+         self.rem_chunk_tokens = rem_chunk_tokens
++        self.dllm_config = dllm_config
++
++        if self.dllm_config is not None:
++            self._init_dllm_meta(dllm_config)
++
+         if self.rem_chunk_tokens is not None:
+             self.rem_chunk_tokens -= mixed_with_decode_tokens
+ 
+@@ -369,6 +376,12 @@ class PrefillAdder:
+         )
+         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+ 
++    def _init_dllm_meta(self, dllm_config: DllmConfig):
++        self.dllm_block_size = dllm_config.block_size
++        max_running_reqs = dllm_config.max_running_requests
++
++        self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
++
+     def _get_running_request_total_token_offset(self, req: Req) -> int:
+         return (
+             min(
+@@ -429,11 +442,16 @@ class PrefillAdder:
+         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+             return AddReqResult.NO_TOKEN
+ 
+-        if self.rem_input_tokens <= 0 or (
+-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
+-        ):
++        if self.rem_input_tokens <= 0:
+             return AddReqResult.OTHER
+ 
++        if self.dllm_config is not None:
++            if self.rem_dllm_tokens <= 0:
++                return AddReqResult.OTHER
++        else:
++            if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
++                return AddReqResult.OTHER
++
+         return AddReqResult.CONTINUE
+ 
+     def _update_prefill_budget(
+@@ -445,14 +463,88 @@ class PrefillAdder:
+         self.rem_total_token_offset += extend_input_len + max_new_tokens
+         self.cur_rem_token_offset += extend_input_len
+         self.rem_input_tokens -= extend_input_len
+-        if self.rem_chunk_tokens is not None:
++
++        if self.dllm_config is not None:
++            self.rem_dllm_tokens -= extend_input_len
++        elif self.rem_chunk_tokens is not None:
+             self.rem_chunk_tokens -= extend_input_len
+ 
+         self.log_hit_tokens += prefix_len
+         self.log_input_tokens += extend_input_len
+ 
++    def _get_dllm_remain_tokens(self) -> int:
++        _rem_tokens = min(
++            self.rem_dllm_tokens,
++            self.dllm_block_size,
++            int(self.rem_total_tokens),
++        )
++        if _rem_tokens <= 0:
++            _rem_tokens = self.rem_dllm_tokens
++
++        return _rem_tokens
++
++    def _add_dllm_req(self, req: Req, prefix_len: int):
++        # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
++        # the diffusion unmask process may have some problems
++        # Make sure at least one page is available
++        trunc_len = (
++            min(self.rem_dllm_tokens, self.dllm_block_size)
++            // self.page_size
++            * self.page_size
++        )
++
++        req.extend_input_len = trunc_len
++        req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
++
++        self.can_run_list.append(req)
++
++        self._update_prefill_budget(prefix_len, trunc_len, 0)
++
++    def _req_inc_lock_ref(self, req: Req):
++        if self.is_hybrid_swa:
++            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
++            req.swa_uuid_for_lock = swa_uuid_for_lock
++        else:
++            self.tree_cache.inc_lock_ref(req.last_node)
++
++    def add_dllm_staging_req(self, req: Req):
++        assert self.dllm_config is not None
++        _rem_tokens = self._get_dllm_remain_tokens()
++
++        if _rem_tokens <= 0:
++            return AddReqResult.NO_TOKEN
++
++        # Truncate input length to available tokens and update request metadata
++        truncated = req.extend_input_len > _rem_tokens
++        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
++        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
++        self.can_run_list.append(req)
++
++        # Update budget: reserve max_new_tokens only if not truncated
++        max_new_tokens = (
++            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
++            if not truncated
++            else 0
++        )
++        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
++
++        # Return based on remaining token availability
++        return (
++            AddReqResult.NO_TOKEN
++            if self._get_dllm_remain_tokens() <= 0
++            else AddReqResult.CONTINUE
++        )
++
+     def add_chunked_req(self, req: Req):
+-        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
++        if self.dllm_config is not None:
++            _rem_tokens = self._get_dllm_remain_tokens()
++        else:
++            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
++            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
++            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
++            if _rem_tokens <= 0:
++                _rem_tokens = self.rem_chunk_tokens
++
+         truncated = req.extend_input_len > _rem_tokens
+         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+@@ -541,7 +633,12 @@ class PrefillAdder:
+                     return AddReqResult.NO_TOKEN
+                 tokens_freed += tokens_occupied
+ 
+-        if (
++        if self.dllm_config is not None:
++            if self.rem_dllm_tokens <= 0:
++                return AddReqResult.OTHER
++
++            self._add_dllm_req(req, 0)
++        elif (
+             self.rem_chunk_tokens is None  # chunked prefill is disabled
+             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+         ):
+@@ -613,14 +710,21 @@ class PrefillAdder:
+             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                 return AddReqResult.OTHER
+ 
+-            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
++            if self.dllm_config is not None:
++                if self.rem_dllm_tokens <= 0:
++                    return AddReqResult.OTHER
++
++                assert (
++                    truncation_align_size is None
++                ), "truncation_align_size is not supported for dllm prefill"
++
++                self._add_dllm_req(req, prefix_len)
++                self._req_inc_lock_ref(req)
++            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+                 # Non-chunked prefill
+                 self.can_run_list.append(req)
+-                if self.is_hybrid_swa:
+-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+-                    req.swa_uuid_for_lock = swa_uuid_for_lock
+-                else:
+-                    self.tree_cache.inc_lock_ref(req.last_node)
++
++                self._req_inc_lock_ref(req)
+                 self._update_prefill_budget(
+                     prefix_len,
+                     input_tokens,
+@@ -632,6 +736,7 @@ class PrefillAdder:
+             else:
+                 # Make sure at least one page is available
+                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
++
+                 if trunc_len <= 0:
+                     return AddReqResult.OTHER
+ 
+@@ -652,11 +757,8 @@ class PrefillAdder:
+ 
+                 self.can_run_list.append(req)
+                 self.new_chunked_req = req
+-                if self.is_hybrid_swa:
+-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+-                    req.swa_uuid_for_lock = swa_uuid_for_lock
+-                else:
+-                    self.tree_cache.inc_lock_ref(req.last_node)
++
++                self._req_inc_lock_ref(req)
+                 self._update_prefill_budget(prefix_len, trunc_len, 0)
+ 
+         return self.budget_state()
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index b801fd8f8..1c57517b0 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -60,7 +60,7 @@ from sglang.srt.disaggregation.utils import (
+     prepare_abort,
+ )
+ from sglang.srt.distributed import get_pp_group, get_world_group
+-from sglang.srt.dllm.config import DllmConfig
++from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+ from sglang.srt.environ import envs
+ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+ from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+@@ -210,6 +210,7 @@ class EmbeddingBatchResult:
+ 
+ class Scheduler(
+     SchedulerOutputProcessorMixin,
++    SchedulerDllmMixin,
+     SchedulerUpdateWeightsMixin,
+     SchedulerProfilerMixin,
+     SchedulerMetricsMixin,
+@@ -289,8 +290,8 @@ class Scheduler(
+         # Init model config
+         self.model_config = ModelConfig.from_server_args(server_args)
+ 
+-        # Init diffusion LLM config
+-        self.dllm_config = DllmConfig.from_server_args(server_args)
++        # Init diffusion LLM config and its scheduling queues.
++        self.init_diffusion_llm()
+ 
+         # Init inter-process communication
+         self.init_sockets(server_args, port_args)
+@@ -1635,11 +1636,14 @@ class Scheduler(
+ 
+     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+         if self.dllm_config is not None:
+-            if self.chunked_req is not None and self.chunked_req.finished():
+-                self.chunked_req = None
++            self.dllm_manager.filter_finished_reqs()
+ 
+         # Merge the prefill batch into the running batch
+         chunked_req_to_exclude = set()
++        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
++            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
++            for req in self.dllm_manager.staging_queue:
++                self.stash_chunked_request(req)
+         if self.chunked_req:
+             # Move the chunked request out of the batch so that we can merge
+             # only finished requests to running_batch.
+@@ -1675,7 +1679,11 @@ class Scheduler(
+                     # Merge running_batch with prefill batch
+                     self.running_batch.merge_batch(self.last_batch)
+ 
+-        new_batch = self.get_new_batch_prefill()
++        new_batch = (
++            self.get_new_batch_dllm()
++            if self.dllm_config is not None
++            else self.get_new_batch_prefill()
++        )
+ 
+         need_mlp_sync = self.require_mlp_sync
+         if need_mlp_sync and not self.spec_algorithm.is_none():
+diff --git a/python/sglang/srt/managers/scheduler_output_processor_mixin.py b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+index c48f5f893..d6269bea5 100644
+--- a/python/sglang/srt/managers/scheduler_output_processor_mixin.py
++++ b/python/sglang/srt/managers/scheduler_output_processor_mixin.py
+@@ -281,7 +281,7 @@ class SchedulerOutputProcessorMixin:
+ 
+         return predict_tokens
+ 
+-    def process_batch_result_dllm(
++    def process_batch_result_idle(
+         self: Scheduler,
+         batch: ScheduleBatch,
+         result: GenerationBatchResult,
+@@ -289,27 +289,9 @@ class SchedulerOutputProcessorMixin:
+         if result.copy_done is not None:
+             result.copy_done.synchronize()
+ 
+-        next_token_ids = result.next_token_ids.tolist()
+-        self.num_generated_tokens += len(next_token_ids)
+-
+-        self.token_to_kv_pool_allocator.free_group_begin()
+-
+-        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
+-        req = batch.reqs[0]
+-
+-        for next_token_id in next_token_ids:
+-            req.output_ids.append(next_token_id)
+-            req.check_finished()
+-
+-            if req.finished():
+-                release_kv_cache(req, self.tree_cache)
+-                req.time_stats.completion_time = time.perf_counter()
+-                break
+-
+-            self.tree_cache.cache_unfinished_req(req)
+-
+-        self.stream_output(batch.reqs, batch.return_logprob)
+-        self.token_to_kv_pool_allocator.free_group_end()
++        self.stream_output_generation(
++            batch.reqs, batch.return_logprob, is_idle_batch=True
++        )
+ 
+     def process_batch_result_decode(
+         self: Scheduler,
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+index 5df932295..ac2c779f6 100644
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -2,7 +2,7 @@ from __future__ import annotations
+ 
+ import dataclasses
+ import logging
+-from typing import TYPE_CHECKING, List, Optional
++from typing import TYPE_CHECKING, List, Optional, Union
+ 
+ import torch
+ 
+@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
+ class GenerationBatchResult:
+     logits_output: Optional[LogitsProcessorOutput] = None
+     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+-    next_token_ids: Optional[torch.Tensor] = None
++    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+     num_accepted_tokens: Optional[int] = None
++    accept_length_per_req_cpu: Optional[List[int]] = None
+     can_run_cuda_graph: bool = False
+ 
+     # For output processing
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index 7cefcfa16..1fd483da3 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -40,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
+     graph_capture,
+     set_pdmux_status,
+ )
++from sglang.srt.dllm.config import DllmConfig
+ from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+ from sglang.srt.layers.dp_attention import (
+     DpPaddingMode,
+@@ -263,6 +264,9 @@ class CudaGraphRunner:
+ 
+         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+ 
++        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
++        self.is_dllm = self.dllm_config is not None
++
+         # Batch sizes to capture
+         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+@@ -283,6 +287,9 @@ class CudaGraphRunner:
+                 self.num_tokens_per_bs = (
+                     self.model_runner.server_args.speculative_num_draft_tokens
+                 )
++        elif self.is_dllm:
++            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
++            self.num_tokens_per_bs = self.dllm_config.block_size
+ 
+         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
+         if model_runner.server_args.enable_return_hidden_states:
+@@ -299,6 +306,8 @@ class CudaGraphRunner:
+         self.maybe_init_pdmux()
+         self.seq_len_fill_value = (
+             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
++            if self.dllm_config is None
++            else self.dllm_config.block_size
+         )
+ 
+         self.encoder_len_fill_value = 0
+@@ -825,7 +834,14 @@ class CudaGraphRunner:
+         output = self.output_buffers[graph_key]
+         if isinstance(output, LogitsProcessorOutput):
+             return LogitsProcessorOutput(
+-                next_token_logits=output.next_token_logits[: self.raw_num_token],
++                next_token_logits=(
++                    output.next_token_logits[: self.raw_num_token]
++                    if not self.is_dllm
++                    else None
++                ),
++                full_logits=(
++                    output.full_logits[: self.raw_num_token] if self.is_dllm else None
++                ),
+                 hidden_states=(
+                     output.hidden_states[: self.raw_num_token]
+                     if output.hidden_states is not None
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 3437f2ef8..7c3a841c1 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -90,6 +90,9 @@ class ForwardMode(IntEnum):
+     # Split Prefill for PD multiplexing
+     SPLIT_PREFILL = auto()
+ 
++    # Used in dLLM
++    DLLM_EXTEND = auto()
++
+     def is_prefill(self):
+         return self.is_extend()
+ 
+@@ -101,6 +104,7 @@ class ForwardMode(IntEnum):
+             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
+             or self == ForwardMode.TARGET_VERIFY
+             or self == ForwardMode.SPLIT_PREFILL
++            or self == ForwardMode.DLLM_EXTEND
+         )
+ 
+     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+@@ -152,6 +156,7 @@ class ForwardMode(IntEnum):
+             self == ForwardMode.DECODE
+             or self == ForwardMode.TARGET_VERIFY
+             or self == ForwardMode.IDLE
++            or self == ForwardMode.DLLM_EXTEND
+         )
+ 
+     def is_cpu_graph(self):
+@@ -170,6 +175,9 @@ class ForwardMode(IntEnum):
+     def is_prebuilt(self):
+         return self == ForwardMode.PREBUILT
+ 
++    def is_dllm_extend(self):
++        return self == ForwardMode.DLLM_EXTEND
++
+ 
+ @total_ordering
+ class CaptureHiddenMode(IntEnum):
+@@ -441,8 +449,9 @@ class ForwardBatch:
+             block_size = batch.dllm_config.block_size
+             ret.positions = torch.tensor(
+                 [
+-                    [i for i in range(block_offset, block_offset + block_size)]
++                    i
+                     for block_offset in batch.dllm_block_offsets
++                    for i in range(block_offset, block_offset + block_size)
+                 ],
+                 dtype=torch.int32,
+             ).to(device, non_blocking=True)
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 6e3af4623..03ec62168 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -461,7 +461,7 @@ class ServerArgs:
+ 
+     # Diffusion LLM
+     dllm_algorithm: Optional[str] = None
+-    dllm_block_size: Optional[int] = None
++    dllm_algorithm_config: Optional[str] = None
+ 
+     # Double Sparsity
+     enable_double_sparsity: bool = False
+@@ -2049,26 +2049,61 @@ class ServerArgs:
+         if self.dllm_algorithm is None:
+             return
+         if not self.disable_cuda_graph:
+-            logger.warning(
+-                "Cuda graph is disabled because of using diffusion LLM inference"
+-            )
+-            self.disable_cuda_graph = True
++            if self.attention_backend != "flashinfer":
++                logger.warning(
++                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
++                )
++                self.attention_backend = "flashinfer"
+         if not self.disable_overlap_schedule:
+             logger.warning(
+                 "Overlap schedule is disabled because of using diffusion LLM inference"
+             )
+             self.disable_overlap_schedule = True
++
+         if not self.disable_radix_cache:
+-            logger.warning(
+-                "Radix cache is disabled because of using diffusion LLM inference"
+-            )
+-            self.disable_radix_cache = True
++            from sglang.srt.dllm.config import DllmConfig
++
++            config = DllmConfig.from_server_args(self)
++            if self.page_size % config.block_size != 0:
++                logger.warning(
++                    f"Setting page size to {config.block_size} for diffusion LLM inference"
++                )
++                self.page_size = config.block_size
++            if self.enable_hierarchical_cache:
++                logger.warning(
++                    "Hierarchical cache is disabled because of using diffusion LLM inference"
++                )
++                self.enable_hierarchical_cache = False
++            if self.enable_lmcache:
++                logger.warning(
++                    "LMCache is disabled because of using diffusion LLM inference"
++                )
++                self.enable_lmcache = False
++
+         if not self.pp_size > 1:
+             logger.warning(
+                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
+             )
+             self.pp_size = 1
+ 
++        if self.enable_lora:
++            logger.warning(
++                "Currently LoRA is not supported by diffusion LLM inference."
++            )
++            self.enable_lora = False
++
++        if self.disaggregation_mode != "null":
++            logger.warning(
++                "Currently disaggregation is not supported by diffusion LLM inference."
++            )
++            self.disaggregation_mode = "null"
++
++        if self.enable_mixed_chunk:
++            logger.warning(
++                "Mixed chunked prefill is disabled because of using diffusion LLM inference."
++            )
++            self.enable_mixed_chunk = False
++
+     def _handle_other_validations(self):
+         # Handle model inference tensor dump.
+         if self.debug_tensor_dump_output_folder is not None:
+@@ -3352,13 +3387,13 @@ class ServerArgs:
+             "--dllm-algorithm",
+             type=str,
+             default=ServerArgs.dllm_algorithm,
+-            help="The diffusion LLM algorithm.",
++            help="The diffusion LLM algorithm, such as LowConfidence.",
+         )
+         parser.add_argument(
+-            "--dllm-block-size",
+-            type=int,
+-            default=ServerArgs.dllm_block_size,
+-            help="The number of tokens processed in each iteration of the block diffusion LLM.",
++            "--dllm-algorithm-config",
++            type=str,
++            default=ServerArgs.dllm_algorithm_config,
++            help="The diffusion LLM algorithm configurations. Must be a YAML file.",
+         )
+ 
+         # Double Sparsity

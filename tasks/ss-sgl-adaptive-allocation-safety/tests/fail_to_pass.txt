@@ -1,0 +1,3 @@
+/tests/postmerge_tests/test/registered/unit/spec/test_adaptive_allocation_safety.py::test_adaptive_tokenizer_reserves_largest_reachable_draft
+/tests/postmerge_tests/test/registered/unit/spec/test_adaptive_allocation_safety.py::test_adaptive_decode_allocation_uses_largest_reachable_draft
+/tests/postmerge_tests/test/registered/unit/spec/test_adaptive_allocation_safety.py::test_adaptive_capacity_is_stable_for_one_launch

@@ -1,0 +1,2 @@
+test/registered/piecewise_cuda_graph/test_pcg_mixed_flashinfer_public.py::test_long_decode_mixed_chunk_reuses_extend_graph
+test/registered/piecewise_cuda_graph/test_pcg_mixed_flashinfer_public.py::test_mixed_chunk_replay_matches_disabled_reference

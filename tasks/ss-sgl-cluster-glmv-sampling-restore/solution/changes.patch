@@ -1,0 +1,322 @@
+diff --git a/python/sglang/srt/sampling/penaltylib/__init__.py b/python/sglang/srt/sampling/penaltylib/__init__.py
+index 26a780517..9ba6d73ac 100644
+--- a/python/sglang/srt/sampling/penaltylib/__init__.py
++++ b/python/sglang/srt/sampling/penaltylib/__init__.py
+@@ -2,10 +2,12 @@ from sglang.srt.sampling.penaltylib.frequency_penalty import BatchedFrequencyPen
+ from sglang.srt.sampling.penaltylib.min_new_tokens import BatchedMinNewTokensPenalizer
+ from sglang.srt.sampling.penaltylib.orchestrator import BatchedPenalizerOrchestrator
+ from sglang.srt.sampling.penaltylib.presence_penalty import BatchedPresencePenalizer
++from sglang.srt.sampling.penaltylib.repetition_penalty import BatchedRepetitionPenalizer
+ 
+ __all__ = [
+     "BatchedFrequencyPenalizer",
+     "BatchedMinNewTokensPenalizer",
+     "BatchedPresencePenalizer",
+     "BatchedPenalizerOrchestrator",
++    "BatchedRepetitionPenalizer",
+ ]
+diff --git a/python/sglang/srt/sampling/penaltylib/orchestrator.py b/python/sglang/srt/sampling/penaltylib/orchestrator.py
+index 7ef123f55..650c719f3 100644
+--- a/python/sglang/srt/sampling/penaltylib/orchestrator.py
++++ b/python/sglang/srt/sampling/penaltylib/orchestrator.py
+@@ -52,19 +52,56 @@ class BatchedPenalizerOrchestrator:
+         for penalizer in self.penalizers.values():
+             penalizer.cumulate_output_tokens(output_ids=output_ids)
+ 
+-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
++    def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
+         """
+-        Apply the penalizers to the logits.
+-        Note that it may apply the penalizers in-place.
++        Apply all penalizers to the logits in-place.
+ 
+         Args:
+-            logits (torch.Tensor): The logits to apply the penalizers to.
+-
+-        Returns:
+-            torch.Tensor: The logits after applying the penalizers.
++            logits: The logits tensor to apply penalties to.
++            repeat: If set (speculative decoding), per-request penalties are
++                expanded via repeat_interleave to match the draft token layout.
++                Additive penalties are captured into a zeros tensor, expanded,
++                then added; scaling penalties are accumulated, expanded, then
++                applied directly.
+         """
++        if repeat is None:
++            for penalizer in self.penalizers.values():
++                penalizer.apply(logits)
++        else:
++            # Additive: capture into zeros, expand, add
++            bs = logits.shape[0] // repeat
++            additive = torch.zeros(
++                (bs, logits.shape[1]), dtype=torch.float32, device=logits.device
++            )
++            self.accumulate_additive_penalties(additive)
++            logits.add_(torch.repeat_interleave(additive, repeat, dim=0))
++            # Scaling: accumulate, expand, apply
++            accumulated = self.accumulate_scaling_penalties()
++            if accumulated is not None:
++                from sglang.srt.sampling.penaltylib.repetition_penalty import (
++                    apply_scaling_penalties,
++                )
++
++                expanded = torch.repeat_interleave(accumulated, repeat, dim=0)
++                apply_scaling_penalties(logits, expanded)
++
++    def accumulate_additive_penalties(self, logits: torch.Tensor):
++        """Apply only additive (non-multiplicative) penalizers."""
+         for penalizer in self.penalizers.values():
+-            penalizer.apply(logits)
++            if not penalizer.is_multiplicative:
++                penalizer.apply(logits)
++
++    def accumulate_scaling_penalties(self) -> Optional[torch.Tensor]:
++        """Accumulate all multiplicative penalty tensors into one, or None if none active."""
++        result = None
++        for penalizer in self.penalizers.values():
++            if not penalizer._is_prepared or not penalizer.is_multiplicative:
++                continue
++            if result is None:
++                result = penalizer.get_scaling_penalties().clone()
++            else:
++                result *= penalizer.get_scaling_penalties()
++        return result
+ 
+     def filter(self, keep_indices: torch.Tensor):
+         """
+@@ -132,6 +169,8 @@ class _BatchedPenalizer(abc.ABC):
+     An abstract class for a batched penalizer.
+     """
+ 
++    is_multiplicative: bool = False
++
+     def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
+         self._orchestrator_ref: weakref.ReferenceType[BatchedPenalizerOrchestrator] = (
+             weakref.ref(orchestrator)
+@@ -227,6 +266,13 @@ class _BatchedPenalizer(abc.ABC):
+         """
+         pass
+ 
++    def get_scaling_penalties(self) -> torch.Tensor:
++        """
++        Return the accumulated scaling penalty tensor for multiplicative penalizers.
++        Only meaningful when is_multiplicative is True. Subclasses should override.
++        """
++        raise NotImplementedError
++
+     @abc.abstractmethod
+     def _filter(self, keep_indices: torch.Tensor):
+         """
+diff --git a/python/sglang/srt/sampling/penaltylib/repetition_penalty.py b/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
+new file mode 100644
+index 000000000..fd03fb2b5
+--- /dev/null
++++ b/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
+@@ -0,0 +1,78 @@
++import torch
++
++from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
++from sglang.srt.utils import get_compiler_backend
++
++
++@torch.compile(dynamic=True, backend=get_compiler_backend())
++def apply_scaling_penalties(logits, scaling_penalties):
++    logits[:] = torch.where(
++        logits < 0,
++        logits * scaling_penalties,
++        logits / scaling_penalties,
++    )
++
++
++class BatchedRepetitionPenalizer(_BatchedPenalizer):
++    """
++    Repetition penalizer penalizes tokens based on their presence in the generated output.
++    """
++
++    is_multiplicative: bool = True
++
++    def _is_required(self) -> bool:
++        return any(
++            req.sampling_params.repetition_penalty != 1.0
++            for req in self.orchestrator.reqs()
++        )
++
++    def _prepare(self):
++        self.cumulated_repetition_penalties = torch.ones(
++            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
++            dtype=torch.float32,
++            device=self.orchestrator.device,
++        )
++        self.repetition_penalties = (
++            torch.tensor(
++                data=[
++                    req.sampling_params.repetition_penalty
++                    for req in self.orchestrator.reqs()
++                ],
++                dtype=torch.float32,
++                device=self.orchestrator.device,
++            )
++        ).unsqueeze_(1)
++
++    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
++        self.cumulated_repetition_penalties.scatter_(
++            dim=1,
++            index=output_ids.unsqueeze(1),
++            src=self.repetition_penalties,
++        )
++
++    def _apply(self, logits: torch.Tensor) -> torch.Tensor:
++        apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
++        return logits
++
++    def get_scaling_penalties(self) -> torch.Tensor:
++        return self.cumulated_repetition_penalties
++
++    def _filter(self, keep_indices: torch.Tensor):
++        self.repetition_penalties = self.repetition_penalties[keep_indices]
++        self.cumulated_repetition_penalties = self.cumulated_repetition_penalties[
++            keep_indices
++        ]
++
++    def _merge(self, their: "BatchedRepetitionPenalizer"):
++        self.repetition_penalties = torch.cat(
++            [self.repetition_penalties, their.repetition_penalties], dim=0
++        )
++        self.cumulated_repetition_penalties = torch.cat(
++            [self.cumulated_repetition_penalties, their.cumulated_repetition_penalties],
++            dim=0,
++        )
++
++    def _teardown(self) -> None:
++        for name in ("repetition_penalties", "cumulated_repetition_penalties"):
++            if hasattr(self, name):
++                delattr(self, name)
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index 914dde0f6..885936b0e 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -8,6 +8,7 @@ import torch
+ 
+ import sglang.srt.sampling.penaltylib as penaltylib
+ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
++from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
+ from sglang.srt.sampling.sampling_params import TOP_K_ALL
+ from sglang.srt.server_args import get_global_server_args
+ 
+@@ -46,7 +47,10 @@ class SamplingBatchInfo:
+ 
+     # Penalizer
+     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
+-    acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
++    acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
++    acc_scaling_penalties: Optional[torch.Tensor] = (
++        None  # Used in the overlap mode for repetition penalty
++    )
+ 
+     # Whether any request has custom logit processor
+     has_custom_logit_processor: bool = False
+@@ -159,6 +163,7 @@ class SamplingBatchInfo:
+                 penaltylib.BatchedFrequencyPenalizer,
+                 penaltylib.BatchedMinNewTokensPenalizer,
+                 penaltylib.BatchedPresencePenalizer,
++                penaltylib.BatchedRepetitionPenalizer,
+             },
+         )
+ 
+@@ -229,19 +234,29 @@ class SamplingBatchInfo:
+ 
+     def update_penalties(self):
+         if self.penalizer_orchestrator.is_required:
+-            self.acc_linear_penalties = torch.zeros(
++            self.acc_additive_penalties = torch.zeros(
+                 (len(self.temperatures), self.vocab_size),
+                 dtype=torch.float32,
+                 device=self.temperatures.device,
+             )
+-            self.penalizer_orchestrator.apply(self.acc_linear_penalties)
++            self.penalizer_orchestrator.accumulate_additive_penalties(
++                self.acc_additive_penalties
++            )
++            self.acc_scaling_penalties = (
++                self.penalizer_orchestrator.accumulate_scaling_penalties()
++            )
+         else:
+-            self.acc_linear_penalties = None
++            self.acc_additive_penalties = None
++            self.acc_scaling_penalties = None
+ 
+     def apply_logits_bias(self, logits: torch.Tensor):
+-        if self.acc_linear_penalties is not None:
++        if self.acc_additive_penalties is not None:
++            # Used in the overlap mode
++            logits.add_(self.acc_additive_penalties)
++
++        if self.acc_scaling_penalties is not None:
+             # Used in the overlap mode
+-            logits.add_(self.acc_linear_penalties)
++            apply_scaling_penalties(logits, self.acc_scaling_penalties)
+ 
+         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+             # Used in the non-overlap mode
+diff --git a/python/sglang/srt/speculative/eagle_info.py b/python/sglang/srt/speculative/eagle_info.py
+index 572a76f6a..dbb91f555 100644
+--- a/python/sglang/srt/speculative/eagle_info.py
++++ b/python/sglang/srt/speculative/eagle_info.py
+@@ -284,15 +284,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+             or sampling_info.logit_bias is not None
+         ):
+             # This is a relaxed version of penalties for speculative decoding.
+-            linear_penalty = torch.zeros(
+-                (bs, logits_output.next_token_logits.shape[1]),
+-                dtype=torch.float32,
+-                device=batch.device,
+-            )
+-            sampling_info.apply_logits_bias(linear_penalty)
+-            logits_output.next_token_logits.add_(
+-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
++            sampling_info.penalizer_orchestrator.apply(
++                logits_output.next_token_logits, repeat=self.draft_token_num
+             )
++            if sampling_info.logit_bias is not None:
++                logits_output.next_token_logits.add_(
++                    torch.repeat_interleave(
++                        sampling_info.logit_bias, self.draft_token_num, dim=0
++                    )
++                )
+ 
+         # Apply grammar mask
+         if vocab_mask is not None:
+diff --git a/python/sglang/srt/speculative/ngram_info.py b/python/sglang/srt/speculative/ngram_info.py
+index c18cf7965..7aafe9870 100644
+--- a/python/sglang/srt/speculative/ngram_info.py
++++ b/python/sglang/srt/speculative/ngram_info.py
+@@ -398,17 +398,20 @@ class NgramVerifyInput(SpecInput):
+             )
+ 
+         # Apply penalty
+-        if sampling_info.penalizer_orchestrator.is_required:
++        if (
++            sampling_info.penalizer_orchestrator.is_required
++            or sampling_info.logit_bias is not None
++        ):
+             # This is a relaxed version of penalties for speculative decoding.
+-            linear_penalty = torch.zeros(
+-                (bs, logits_output.next_token_logits.shape[1]),
+-                dtype=torch.float32,
+-                device=self.device,
+-            )
+-            sampling_info.apply_logits_bias(linear_penalty)
+-            logits_output.next_token_logits.add_(
+-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
++            sampling_info.penalizer_orchestrator.apply(
++                logits_output.next_token_logits, repeat=self.draft_token_num
+             )
++            if sampling_info.logit_bias is not None:
++                logits_output.next_token_logits.add_(
++                    torch.repeat_interleave(
++                        sampling_info.logit_bias, self.draft_token_num, dim=0
++                    )
++                )
+ 
+         # Apply grammar mask
+         if vocab_mask is not None:

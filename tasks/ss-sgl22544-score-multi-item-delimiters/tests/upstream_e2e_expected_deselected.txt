@@ -1,0 +1,3 @@
+test/registered/prefill_only/test_multi_item_scoring_adapter.py::TestMultiItemScoringOptimizationAdapter::test_mis_empty_query
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_scores_match_hf_reference
+test/registered/prefill_only/test_score_engine.py::TestCausalLMScoring::test_request_avoids_decode_phase

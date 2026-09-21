@@ -1,0 +1,3 @@
+test/registered/dllm/test_sdar_day0_public.py::test_sdar_architecture_defaults
+test/registered/dllm/test_llada2_mini.py::TestSDARDense::test_gsm8k
+test/registered/dllm/test_llada2_mini.py::TestSDARMoE::test_gsm8k

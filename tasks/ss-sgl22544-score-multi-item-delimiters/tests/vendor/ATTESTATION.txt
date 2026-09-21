@@ -1,0 +1,10 @@
+# Vendored offline dependency wheels for the verifier.
+#
+# `distro` is a potential transitive import of the sglang test-util / openai stack. The
+# slim `lmsysorg/sglang:v0.5.10.post1-cu130-runtime` image does not ship it. To keep the
+# verifier hermetic and deterministic, we vendor a pinned, sha256-attested wheel and
+# install it OFFLINE (`pip --no-index --find-links tests/vendor`) only if it is not
+# already importable. The verifier never contacts PyPI.
+#
+# file                                    sha256
+distro-1.9.0-py3-none-any.whl  7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2

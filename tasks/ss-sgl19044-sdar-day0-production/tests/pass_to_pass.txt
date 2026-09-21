@@ -1,0 +1,2 @@
+test/registered/dllm/test_sdar_day0_public.py::test_existing_llada_defaults_are_preserved
+test/registered/dllm/test_sdar_day0_public.py::test_unknown_diffusion_architecture_is_rejected

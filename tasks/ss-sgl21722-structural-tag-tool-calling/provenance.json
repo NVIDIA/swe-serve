@@ -1,0 +1,6 @@
+{
+  "task": "ss-sgl21722-structural-tag-tool-calling",
+  "upstream_pull_requests": [
+    "https://github.com/sgl-project/sglang/pull/21722"
+  ]
+}

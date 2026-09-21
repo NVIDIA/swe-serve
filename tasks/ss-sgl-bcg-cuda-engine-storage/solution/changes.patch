@@ -1,0 +1,1252 @@
+diff --git a/python/sglang/srt/layers/radix_attention.py b/python/sglang/srt/layers/radix_attention.py
+index 449bc8670..64be63f69 100644
+--- a/python/sglang/srt/layers/radix_attention.py
++++ b/python/sglang/srt/layers/radix_attention.py
+@@ -19,11 +19,16 @@ from enum import Enum
+ from typing import TYPE_CHECKING, Optional
+ 
+ import torch
+-from torch import nn
+-
+ from sglang.srt.compilation.compilation_config import register_split_op
+ from sglang.srt.compilation.piecewise_context_manager import get_forward_context
++from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
++    eager_on_graph,
++)
++from sglang.srt.model_executor.breakable_cuda_graph.context import (
++    is_in_breakable_cuda_graph,
++)
+ from sglang.srt.utils.custom_op import register_custom_op
++from torch import nn
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+@@ -119,9 +124,14 @@ class RadixAttention(nn.Module):
+                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
+             else:
+                 output = torch.empty_like(q)
+-            unified_attention_with_output(
+-                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+-            )
++            if is_in_breakable_cuda_graph():
++                bcg_unified_attention_with_output(
++                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
++                )
++            else:
++                unified_attention_with_output(
++                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
++                )
+             return output
+         else:
+             return forward_batch.attn_backend.forward(
+@@ -171,3 +181,6 @@ def unified_attention_with_output(
+ 
+     output.view(ret.shape).copy_(ret)
+     return
++
++
++bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)
+diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/__init__.py b/python/sglang/srt/model_executor/breakable_cuda_graph/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
+new file mode 100644
+index 000000000..7341301ef
+--- /dev/null
++++ b/python/sglang/srt/model_executor/breakable_cuda_graph/breakable_cuda_graph.py
+@@ -0,0 +1,340 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Breakable CUDA Graph: capture a region as a sequence of
++``torch.cuda.CUDAGraph`` segments separated by eager break points.
++
++Each segment is a real ``torch.cuda.CUDAGraph``. Its destructor calls
++``releasePool`` on the shared mempool, so the pool's ``use_count`` tracks how
++many segments are alive; the pool stays pinned as long as any segment graph
++is alive. This lets ``weak_ref_tensor`` views of intermediate pool-allocated
++tensors remain valid across replays — we don't need Python-managed bridge
++buffers to keep break-point tensors at stable addresses.
++"""
++
++import logging
++import threading
++from contextvars import ContextVar
++from typing import Any, Callable
++
++import torch
++
++try:
++    from cuda.bindings import runtime as rt
++except ImportError:
++    rt = None
++
++from sglang.srt.model_executor.breakable_cuda_graph.cuda_utils import checkCudaErrors
++
++logger = logging.getLogger(__name__)
++
++__all__ = [
++    "eager_on_graph",
++    "BreakableCUDAGraph",
++    "BreakableCUDAGraphCapture",
++    "break_graph",
++]
++
++
++def _check_cuda_bindings():
++    if rt is None:
++        raise ImportError(
++            "Breakable CUDA graph requires the 'cuda-python' package. "
++            "Install it with: pip install cuda-python"
++        )
++
++
++# Active BreakableCUDAGraphCapture context for the currently-capturing thread.
++# eager_on_graph's wrapper uses this to split the current torch.cuda.CUDAGraph
++# at break points.
++_current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVar(
++    "current_capture", default=None
++)
++_current_stream_var: ContextVar[torch.cuda.Stream | None] = ContextVar(
++    "current_stream", default=None
++)
++_forked_streams_var: ContextVar[set[torch.cuda.Stream] | None] = ContextVar(
++    "forked_streams", default=None
++)
++
++
++def get_current_stream(device: torch.device | None = None) -> torch.cuda.Stream:
++    stream = _current_stream_var.get()
++    if stream is None:
++        return torch.cuda.current_stream(device)
++    return stream
++
++
++def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
++    _check_cuda_bindings()
++    status, *_ = checkCudaErrors(rt.cudaStreamGetCaptureInfo(stream_ptr))
++    return status
++
++
++def _is_capturing(stream_ptr: int) -> bool:
++    _check_cuda_bindings()
++    return (
++        _capture_status(stream_ptr)
++        == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
++    )
++
++
++# Hook torch.cuda.Stream.wait_stream to track side-stream forks/joins that happen
++# during breakable capture. We need this because capture_end() on a torch
++# CUDAGraph fails if there are still side streams participating in the capture
++# — so before ending each segment we auto-join any forked-but-not-rejoined streams.
++_original_wait_stream: Callable | None = None
++_hook_lock = threading.Lock()
++_hook_refcount = 0
++
++
++def _hooked_wait_stream(self: torch.cuda.Stream, other: torch.cuda.Stream):
++    assert _original_wait_stream is not None
++    forked = _forked_streams_var.get()
++    if forked is None:
++        _original_wait_stream(self, other)
++        return
++    capturing = _current_stream_var.get()
++    if capturing is None:
++        _original_wait_stream(self, other)
++        return
++
++    cap_ptr = capturing.cuda_stream
++    is_self_cap = self is capturing or self.cuda_stream == cap_ptr
++    is_other_cap = other is capturing or other.cuda_stream == cap_ptr
++
++    if is_self_cap and not is_other_cap:
++        if (
++            _capture_status(other.cuda_stream)
++            != rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
++        ):
++            return
++        _original_wait_stream(self, other)
++        forked.discard(other)
++    elif is_other_cap and not is_self_cap:
++        _original_wait_stream(self, other)
++        forked.add(self)
++    else:
++        _original_wait_stream(self, other)
++
++
++def _install_wait_stream_hook():
++    global _original_wait_stream, _hook_refcount
++    with _hook_lock:
++        if _hook_refcount == 0:
++            _original_wait_stream = torch.cuda.Stream.wait_stream
++            torch.cuda.Stream.wait_stream = _hooked_wait_stream  # type: ignore[assignment]
++        _hook_refcount += 1
++
++
++def _uninstall_wait_stream_hook():
++    global _original_wait_stream, _hook_refcount
++    with _hook_lock:
++        _hook_refcount -= 1
++        if _hook_refcount == 0:
++            assert _original_wait_stream is not None, "wait_stream hook not installed"
++            torch.cuda.Stream.wait_stream = _original_wait_stream  # type: ignore[assignment]
++            _original_wait_stream = None
++
++
++def _weak_ref_if_tensor(x):
++    """Return a weak-ref tensor view (shared storage, no refcount) for tensors;
++    pass-through for non-tensors. Weak-ref'ing captured args lets the shared
++    mempool reclaim per-layer intermediates between segments — storage stays
++    alive for each segment CUDAGraph's lifetime via its pool use_count.
++
++    ``weak_ref_tensors`` is imported lazily: the module hard-raises on
++    non-CUDA/NPU platforms, and we only reach this code during an active
++    BCG capture (which can't happen on CPU-only runners anyway)."""
++    if torch.is_tensor(x):
++        from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
++
++        return weak_ref_tensors(x)
++    return x
++
++
++def _copy_output(dst: Any, src: Any) -> Any:
++    """Copy src output into dst in-place where possible.
++
++    Handles plain tensors, dataclass/object with tensor attributes,
++    and dicts of tensors. Returns dst if in-place copy succeeded,
++    otherwise returns src.
++    """
++    if torch.is_tensor(dst) and torch.is_tensor(src):
++        dst.copy_(src)
++        return dst
++
++    if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
++        for key, src_val in src.__dict__.items():
++            dst_val = getattr(dst, key, None)
++            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
++                dst_val.copy_(src_val)
++            else:
++                setattr(dst, key, src_val)
++        return dst
++
++    if isinstance(dst, dict) and isinstance(src, dict):
++        for key, src_val in src.items():
++            dst_val = dst.get(key)
++            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
++                dst_val.copy_(src_val)
++            else:
++                dst[key] = src_val
++        return dst
++
++    return src
++
++
++def eager_on_graph(enable: bool):
++    def decorator(inner: Callable):
++        if not enable:
++            return inner
++
++        def wrapper(*args, **kwargs):
++            capture = _current_capture_var.get()
++            if capture is None:
++                return inner(*args, **kwargs)
++
++            logger.debug("Break graph due to function: %s", inner.__name__)
++
++            # End the segment that captured up to this break point.
++            capture._end_current_segment()
++
++            # Run the eager function once so it allocates its outputs and
++            # writes real data into them.
++            output = inner(*args, **kwargs)
++
++            # Weak-ref the closure state. Storage lives with the segment
++            # CUDAGraphs' mempool pin; Python refs don't need to prevent
++            # pool reuse across layers.
++            captured_inner = inner
++            captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
++            captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
++            captured_output = _weak_ref_if_tensor(output)
++
++            def replay_fn():
++                new_out = captured_inner(*captured_args, **captured_kwargs)
++                return _copy_output(captured_output, new_out)
++
++            capture.cuda_graph._break_fns.append(replay_fn)
++
++            # Start a fresh CUDAGraph segment for the remainder of the forward.
++            capture._begin_new_segment()
++            return output
++
++        return wrapper
++
++    return decorator
++
++
++class BreakableCUDAGraph:
++    """Container holding one ``torch.cuda.CUDAGraph`` per segment plus an
++    eager break function between consecutive segments."""
++
++    def __init__(self) -> None:
++        self._segments: list[torch.cuda.CUDAGraph] = []
++        self._break_fns: list[Callable[[], Any]] = []
++
++    def replay(self) -> None:
++        stream = torch.cuda.current_stream()
++        token = _current_stream_var.set(stream)
++        try:
++            for i, seg in enumerate(self._segments):
++                seg.replay()
++                if i < len(self._break_fns):
++                    self._break_fns[i]()
++        finally:
++            _current_stream_var.reset(token)
++
++
++class BreakableCUDAGraphCapture:
++    """Context manager that captures the enclosed code as one or more
++    ``torch.cuda.CUDAGraph`` segments separated by eager break points.
++
++    Each segment shares the supplied ``pool`` (``MempoolId_t`` tuple) so
++    pool-allocated intermediates can be reused across segments. While any
++    segment is alive, its ``beginAllocateToPool`` call keeps the mempool's
++    ``use_count`` > 0, which makes ``weak_ref_tensor`` of segment-allocated
++    tensors safe across subsequent replays.
++    """
++
++    def __init__(
++        self,
++        cuda_graph: BreakableCUDAGraph,
++        pool=None,
++        stream: torch.cuda.Stream | None = None,
++        capture_error_mode: str = "global",
++    ):
++        assert isinstance(
++            cuda_graph, BreakableCUDAGraph
++        ), "cuda_graph must be a BreakableCUDAGraph"
++        self.cuda_graph = cuda_graph
++        self._pool = pool if pool is not None else (0, 0)
++        self._stream = stream
++        self._capture_error_mode = capture_error_mode
++        self._stream_ctx = None
++        self._capture_token = None
++        self._stream_token = None
++        self._forked_token = None
++
++    def __enter__(self):
++        _install_wait_stream_hook()
++        if self._stream is not None:
++            self._stream_ctx = torch.cuda.stream(self._stream)
++            self._stream_ctx.__enter__()
++        self._capture_token = _current_capture_var.set(self)
++        self._stream_token = _current_stream_var.set(
++            self._stream or torch.cuda.current_stream()
++        )
++        self._forked_token = _forked_streams_var.set(set())
++        self._begin_new_segment()
++        return self
++
++    def __exit__(self, *args: object):
++        try:
++            self._end_current_segment()
++        finally:
++            _forked_streams_var.reset(self._forked_token)
++            _current_stream_var.reset(self._stream_token)
++            _current_capture_var.reset(self._capture_token)
++            if self._stream_ctx is not None:
++                self._stream_ctx.__exit__(*args)
++                self._stream_ctx = None
++            _uninstall_wait_stream_hook()
++        return False
++
++    def _begin_new_segment(self) -> None:
++        graph = torch.cuda.CUDAGraph()
++        graph.capture_begin(
++            pool=self._pool, capture_error_mode=self._capture_error_mode
++        )
++        self.cuda_graph._segments.append(graph)
++
++    def _end_current_segment(self) -> None:
++        # Auto-join any side streams forked during this segment but not joined.
++        main_stream = get_current_stream()
++        forked = _forked_streams_var.get()
++        if forked:
++            assert _original_wait_stream is not None
++            for side in list(forked):
++                if _is_capturing(side.cuda_stream):
++                    _original_wait_stream(main_stream, side)
++            forked.clear()
++        self.cuda_graph._segments[-1].capture_end()
++
++
++@eager_on_graph(True)
++def break_graph() -> None:
++    """Insert a graph break. The @eager_on_graph decorator does the actual
++    segment split; this function body intentionally does nothing."""
++    pass
+diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/context.py b/python/sglang/srt/model_executor/breakable_cuda_graph/context.py
+new file mode 100644
+index 000000000..ec4038343
+--- /dev/null
++++ b/python/sglang/srt/model_executor/breakable_cuda_graph/context.py
+@@ -0,0 +1,63 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Runtime state for the breakable CUDA graph (BCG) runner.
++
++Kept intentionally separate from ``compilation/piecewise_context_manager.py``:
++BCG no longer inherits from the torch.compile-based PCG path, so its
++capture/replay lifecycle is managed on its own.
++"""
++
++from __future__ import annotations
++
++import logging
++from contextlib import contextmanager
++
++logger = logging.getLogger(__name__)
++
++_in_breakable_cuda_graph = False
++
++
++def is_in_breakable_cuda_graph() -> bool:
++    return _in_breakable_cuda_graph
++
++
++@contextmanager
++def enable_breakable_cuda_graph():
++    """Mark the enclosed scope as inside a BCG capture/replay. Any exception
++    raised inside is logged with the BCG-specific failure hint, then re-raised
++    for the caller to handle."""
++    global _in_breakable_cuda_graph
++    _in_breakable_cuda_graph = True
++    try:
++        yield
++    except Exception as exc:
++        logger.error(
++            "%s: %s\nBreakable CUDA graph capture or replay failed.\n%s",
++            type(exc).__name__,
++            exc,
++            BCG_FAILURE_HINT,
++        )
++        raise
++    finally:
++        _in_breakable_cuda_graph = False
++
++
++BCG_FAILURE_HINT = (
++    "1. switch to the torch.compile piecewise backend with "
++    "--disable-breakable-cuda-graph\n"
++    "2. disable the prefill CUDA graph with --disable-piecewise-cuda-graph\n"
++    "3. if it is an OOM problem, set --mem-fraction-static to a smaller value "
++    "(e.g., 0.8 or 0.7) or set --piecewise-cuda-graph-max-tokens to a smaller value "
++    "(e.g., 2048)\n"
++)
+diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph/cuda_utils.py b/python/sglang/srt/model_executor/breakable_cuda_graph/cuda_utils.py
+new file mode 100644
+index 000000000..c95471012
+--- /dev/null
++++ b/python/sglang/srt/model_executor/breakable_cuda_graph/cuda_utils.py
+@@ -0,0 +1,53 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""CUDA runtime binding utilities."""
++
++try:
++    from cuda.bindings import runtime as rt
++except ImportError:
++    rt = None
++
++
++def _cudaGetErrorString(error):
++    if rt is None:
++        return "<cuda.bindings not available>"
++    err, msg = rt.cudaGetErrorString(error)
++    if err != rt.cudaError_t.cudaSuccess:
++        return "<unknown>"
++    if isinstance(msg, bytes):
++        return msg.decode("utf-8", "replace")
++    return str(msg)
++
++
++def checkCudaErrors(result):
++    if rt is None:
++        raise RuntimeError(
++            "cuda.bindings is not available. "
++            "Install it with: pip install cuda-python"
++        )
++    if rt is None:
++        raise RuntimeError(
++            "cuda.bindings is not available. "
++            "Install it with: pip install cuda-python"
++        )
++    if result[0] != rt.cudaError_t.cudaSuccess:
++        raise RuntimeError(
++            f"CUDA error {int(result[0])}({_cudaGetErrorString(result[0])})"
++        )
++    if len(result) == 1:
++        return None
++    elif len(result) == 2:
++        return result[1]
++    else:
++        return result[1:]
+diff --git a/python/sglang/srt/model_executor/breakable_cuda_graph_runner.py b/python/sglang/srt/model_executor/breakable_cuda_graph_runner.py
+new file mode 100644
+index 000000000..b0a495960
+--- /dev/null
++++ b/python/sglang/srt/model_executor/breakable_cuda_graph_runner.py
+@@ -0,0 +1,553 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# ==============================================================================
++"""Breakable CUDA graph (BCG) runner.
++
++Captures the model forward as a sequence of ``torch.cuda.CUDAGraph`` segments
++split at attention layers. Functionally parallel to the torch.compile-based
++PCG runner but does not depend on torch.compile or FX graph splitting — graph
++breaks are inserted eagerly via :func:`eager_on_graph` decorated callables
++(radix attention for dense models, mamba for hybrid models).
++"""
++
++from __future__ import annotations
++
++import bisect
++import inspect
++import logging
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any, Optional, Union
++
++import torch
++import tqdm
++from sglang.srt.compilation.piecewise_context_manager import set_forward_context
++from sglang.srt.distributed import get_tensor_model_parallel_rank
++from sglang.srt.distributed.device_communicators.pynccl_allocator import (
++    set_graph_pool_id,
++)
++from sglang.srt.distributed.parallel_state import graph_capture
++from sglang.srt.layers.dp_attention import (
++    set_dp_buffer_len,
++    set_is_extend_in_batch,
++)
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++from sglang.srt.layers.pooler import EmbeddingPoolerOutput
++from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
++    BreakableCUDAGraph,
++    BreakableCUDAGraphCapture,
++)
++from sglang.srt.model_executor.breakable_cuda_graph.context import (
++    enable_breakable_cuda_graph,
++)
++from sglang.srt.model_executor.cuda_graph_runner import (
++    get_global_graph_memory_pool,
++    set_global_graph_memory_pool,
++)
++from sglang.srt.model_executor.forward_batch_info import (
++    CaptureHiddenMode,
++    PPProxyTensors,
++)
++from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
++    PiecewiseCudaGraphRunner,
++    freeze_gc,
++)
++from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
++
++logger = logging.getLogger(__name__)
++
++if TYPE_CHECKING:
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++    from sglang.srt.model_executor.model_runner import ModelRunner
++
++
++@dataclass(frozen=True)
++class ShapeKey:
++    """Typed identifier for one captured breakable CUDA-graph shape."""
++
++    size: int
++    stream_idx: Optional[int] = None
++    variant_label: Optional[str] = None
++
++
++class BreakableCudaGraphRunner:
++    """Breakable CUDA graph runner.
++
++    Captures the model forward as a series of ``torch.cuda.CUDAGraph`` segments
++    with graph breaks at attention layers. Simpler than the torch.compile-based
++    PCG runner: no FX tracing, no compiled-kernel fusion — just segment-level
++    graph capture of the eager kernel stream.
++    """
++
++    def __init__(self, model_runner: ModelRunner):
++        self.model_runner = model_runner
++        self.device = model_runner.device
++        self.device_module = torch.get_device_module(self.device)
++        self.graphs = {}
++        self.output_buffers = {}
++        self.shared_output_buffer: Optional[Any] = None
++
++        self.quant_config = getattr(model_runner.model, "quant_config", None)
++        self.is_multimodal = model_runner.is_multimodal
++        # Read by the shared replay_prepare (bound from PiecewiseCudaGraphRunner).
++        self.capture_return_pooled_hidden_states = not model_runner.is_generation
++
++        # Capture sizes
++        capture_tokens = model_runner.server_args.piecewise_cuda_graph_tokens
++        assert capture_tokens is not None
++        self.capture_num_tokens = sorted(capture_tokens)
++        self.max_num_tokens = (
++            max(self.capture_num_tokens) if self.capture_num_tokens else 8192
++        )
++        self.max_bs = model_runner.req_to_token_pool.size
++
++        self.capture_hidden_mode = CaptureHiddenMode.NULL
++        if model_runner.server_args.enable_return_hidden_states:
++            self.capture_hidden_mode = CaptureHiddenMode.FULL
++
++        log_info_on_rank0(
++            logger,
++            f"[BCG] Capture num tokens: {self.capture_num_tokens}",
++        )
++
++        self._init_buffers(model_runner)
++
++        self.attention_layers = model_runner.attention_layers
++        self.moe_layers = model_runner.moe_layers
++        self.moe_fusions = model_runner.moe_fusions
++
++        # Resolve the inner transformer-stack module (the same boundary PCG draws
++        # via patch_model). At replay we monkey-patch this module's forward with
++        # a closure that replays the captured CUDAGraph and returns the captured
++        # hidden_states; the outer model.forward then runs logits_processor /
++        # pooler eagerly with the live (multi-req) forward_batch.
++        language_model = getattr(
++            model_runner.model, "language_model", model_runner.model
++        )
++        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
++            self.layer_model = language_model.model
++        else:
++            # If we can't find the inner layer_model, disable BCG.
++            self.layer_model = None
++            logger.warning(
++                "[BCG] Could not resolve inner layer_model on %s. BCG is "
++                "disabled for this model; prefill will fall back to eager.",
++                type(language_model).__name__,
++            )
++            return
++        self.use_input_embeds = self.is_multimodal
++        if self.use_input_embeds:
++            sig = inspect.signature(self.layer_model.forward)
++            params = list(sig.parameters)
++            if "input_embeds" not in params:
++                raise ValueError(
++                    f"layer_model.forward must accept 'input_embeds' for "
++                    f"multimodal BCG, got params: {params}"
++                )
++            self._input_embeds_arg_idx = params.index("input_embeds")
++
++        # Memory pool
++        if get_global_graph_memory_pool() is None:
++            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
++        set_graph_pool_id(get_global_graph_memory_pool())
++
++        # Warmup then capture
++        self._warmup()
++        self.device_module.synchronize()
++        self.model_runner.tp_group.barrier()
++        self._capture_all()
++
++        self.raw_num_tokens = 0
++
++    def _init_buffers(self, model_runner):
++        """Initialize input buffers."""
++        from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
++            PrefillInputBuffers,
++        )
++        from sglang.srt.utils import is_npu
++
++        with torch.device(self.device):
++            input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
++            out_cache_loc = torch.zeros(
++                (self.max_num_tokens,),
++                dtype=torch.int64 if not is_npu() else torch.int32,
++            )
++            out_cache_loc_swa = (
++                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
++                if model_runner.is_hybrid_swa
++                else None
++            )
++            positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
++            if self.is_multimodal:
++                input_embeds = torch.zeros(
++                    (self.max_num_tokens, model_runner.model_config.hidden_size),
++                    dtype=model_runner.dtype,
++                )
++                mrope_positions = torch.zeros(
++                    (3, self.max_num_tokens), dtype=torch.int64
++                )
++            else:
++                input_embeds = None
++                mrope_positions = None
++
++        self.buffers = PrefillInputBuffers(
++            input_ids=input_ids,
++            out_cache_loc=out_cache_loc,
++            out_cache_loc_swa=out_cache_loc_swa,
++            mamba_track_indices=None,
++            mamba_track_mask=None,
++            mamba_track_seqlens=None,
++            positions=positions,
++            input_embeds=input_embeds,
++            mrope_positions=mrope_positions,
++        )
++        self.buffers.share_buffers()
++
++    @torch.no_grad()
++    def _run_forward(self, forward_batch, num_tokens):
++        """Run layer-stack forward with proper context.
++
++        Captures only the inner transformer stack (layer_model). The outer
++        model.forward's tail (logits_processor / pooler) is intentionally
++        excluded — it has bs-shaped kernels that would bake batch_size=1
++        into the captured graph.
++
++        ``@torch.no_grad`` mirrors the decorator on the outer ``*ForCausalLM.forward``
++        (e.g. qwen3.py:507). Calling ``layer_model.forward`` directly skips that
++        decorator, so we apply it here — without it some MoE @torch.compile
++        kernels (``torch.sum(out=...)``) fail dynamo with "out= doesn't support
++        autograd", and mamba state ops can spuriously track gradients.
++        """
++        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
++        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
++        set_is_extend_in_batch(False)
++
++        with set_forward_context(
++            forward_batch,
++            self.attention_layers,
++            self.quant_config,
++            self.moe_layers,
++            self.moe_fusions,
++        ):
++            output = self.layer_model.forward(
++                forward_batch.input_ids,
++                forward_batch.positions,
++                forward_batch,
++                input_embeds=forward_batch.input_embeds,
++            )
++        return output
++
++    def _build_capture_forward_batch(self, num_tokens):
++        """Build a bs=1 placeholder ForwardBatch for capture.
++
++        bs=1 here is only a placeholder for attention/mamba breaks' metadata
++        shapes; replay supplies live multi-req metadata via replay_prepare.
++        Captured kernels run only on the token-major layer stack and are
++        bs-invariant.
++        """
++        from sglang.srt.layers.dp_attention import DpPaddingMode
++        from sglang.srt.model_executor.forward_batch_info import (
++            ForwardBatch,
++            ForwardMode,
++        )
++
++        buffers = self.buffers
++        bs = 1
++        with torch.device(self.device):
++            seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
++            extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
++            extend_prefix_lens = torch.zeros((bs,), dtype=torch.int64)
++            extend_start_loc = torch.zeros((bs,), dtype=torch.int64)
++            req_pool_indices = torch.arange(bs, dtype=torch.int64)
++            orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
++
++        return ForwardBatch(
++            forward_mode=ForwardMode.EXTEND,
++            batch_size=bs,
++            input_ids=buffers.input_ids[:num_tokens],
++            input_embeds=(
++                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
++            ),
++            req_pool_indices=req_pool_indices,
++            seq_lens=seq_lens,
++            next_token_logits_buffer=None,
++            orig_seq_lens=orig_seq_lens,
++            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
++            req_to_token_pool=self.model_runner.req_to_token_pool,
++            token_to_kv_pool=self.model_runner.token_to_kv_pool,
++            attn_backend=self.model_runner.attn_backend,
++            out_cache_loc=buffers.out_cache_loc[:num_tokens],
++            out_cache_loc_swa=(
++                buffers.out_cache_loc_swa[:num_tokens]
++                if buffers.out_cache_loc_swa is not None
++                else None
++            ),
++            seq_lens_sum=num_tokens,
++            mamba_track_indices=None,
++            mamba_track_mask=None,
++            mamba_track_seqlens=None,
++            encoder_lens=None,
++            return_logprob=False,
++            extend_num_tokens=num_tokens,
++            extend_seq_lens=extend_seq_lens,
++            extend_prefix_lens=extend_prefix_lens,
++            extend_start_loc=extend_start_loc,
++            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
++            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
++            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
++            positions=buffers.positions[:num_tokens],
++            global_num_tokens_gpu=None,
++            global_num_tokens_for_logprob_gpu=None,
++            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
++            global_dp_buffer_len=None,
++            mrope_positions=(
++                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
++            ),
++            spec_algorithm=None,
++            spec_info=None,
++            capture_hidden_mode=self.capture_hidden_mode,
++            num_token_non_padded=None,
++            global_forward_mode=ForwardMode.EXTEND,
++            lora_ids=None,
++        )
++
++    def _warmup(self):
++        """Warmup the model with a forward pass."""
++        num_tokens = self.capture_num_tokens[0]
++        forward_batch = self._build_capture_forward_batch(num_tokens)
++        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
++        self._run_forward(forward_batch, num_tokens)
++
++    def _capture_all(self):
++        """Capture breakable CUDA graphs for all token sizes."""
++        self.shared_output_buffer = None
++        with freeze_gc(
++            self.model_runner.server_args.enable_cudagraph_gc
++        ), graph_capture() as graph_capture_context, enable_breakable_cuda_graph():
++            stream = graph_capture_context.stream
++            pool = get_global_graph_memory_pool()
++
++            capture_range = (
++                tqdm.tqdm(list(reversed(self.capture_num_tokens)))
++                if get_tensor_model_parallel_rank() == 0
++                else reversed(self.capture_num_tokens)
++            )
++            for num_tokens in capture_range:
++                if get_tensor_model_parallel_rank() == 0:
++                    avail_mem = get_available_gpu_memory(
++                        self.model_runner.device,
++                        self.model_runner.gpu_id,
++                        empty_cache=False,
++                    )
++                    capture_range.set_description(
++                        f"[BCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
++                    )
++
++                graph, output = self._capture_one(num_tokens, pool, stream)
++                from sglang.srt.model_executor.prefill_cuda_graph import (
++                    PrefillCudaGraphFactory,
++                )
++
++                shape_key = PrefillCudaGraphFactory.shape_identity(num_tokens)
++                self.graphs[shape_key] = graph
++                self.output_buffers[shape_key] = output
++
++    def can_run(self, forward_batch: "ForwardBatch"):
++        if self.layer_model is None:
++            return False
++        if forward_batch.forward_mode.is_target_verify():
++            return False
++        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
++            return False
++        if forward_batch.input_embeds is not None:
++            return False
++        if forward_batch.replace_embeds is not None:
++            return False
++        num_tokens = len(forward_batch.input_ids)
++        if forward_batch.return_logprob:
++            for start_len, seq_len in zip(
++                forward_batch.extend_logprob_start_lens_cpu,
++                forward_batch.extend_seq_lens_cpu,
++            ):
++                if start_len is not None and start_len < seq_len:
++                    return False
++        return num_tokens <= self.max_num_tokens
++
++    def _capture_one(self, num_tokens, pool, stream):
++        """Capture a breakable CUDA graph for one token size."""
++        forward_batch = self._build_capture_forward_batch(num_tokens)
++        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
++
++        def run_once():
++            return self._run_forward(forward_batch, num_tokens)
++
++        for _ in range(2):
++            self.device_module.synchronize()
++            self.model_runner.tp_group.barrier()
++            run_once()
++
++        graph = BreakableCUDAGraph()
++        with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
++            output = run_once()
++            if self.shared_output_buffer is not None:
++                self._copy_output_to_buffer(
++                    output, self.shared_output_buffer, num_tokens
++                )
++
++        if self.shared_output_buffer is None:
++            self.shared_output_buffer = output
++        stored_output = self._slice_output(self.shared_output_buffer, num_tokens)
++
++        return graph, stored_output
++
++    def _slice_output(self, output: Any, num_tokens: int) -> Any:
++        if output is None:
++            return None
++        if torch.is_tensor(output):
++            return output[:num_tokens]
++        if isinstance(output, PPProxyTensors):
++            return output[:num_tokens]
++        if isinstance(output, tuple):
++            return tuple(self._slice_output(item, num_tokens) for item in output)
++        if isinstance(output, list):
++            return [self._slice_output(item, num_tokens) for item in output]
++        raise TypeError(f"Unsupported BCG output type: {type(output)}")
++
++    def _copy_output_to_buffer(
++        self, output: Any, output_buffer: Any, num_tokens: int
++    ) -> None:
++        if output is None or output_buffer is None:
++            if output is None and output_buffer is None:
++                return
++            raise ValueError(
++                "BCG output structure changed between capture sizes: "
++                f"{type(output)} vs {type(output_buffer)}"
++            )
++        if torch.is_tensor(output) and torch.is_tensor(output_buffer):
++            output_buffer[:num_tokens].copy_(output[:num_tokens])
++            return
++        if isinstance(output, PPProxyTensors) and isinstance(
++            output_buffer, PPProxyTensors
++        ):
++            if output.tensors.keys() != output_buffer.tensors.keys():
++                raise ValueError(
++                    "BCG output proxy structure changed between capture sizes: "
++                    f"{output.tensors.keys()} != {output_buffer.tensors.keys()}"
++                )
++            for key, tensor in output.tensors.items():
++                self._copy_output_to_buffer(
++                    tensor, output_buffer.tensors[key], num_tokens
++                )
++            return
++        if isinstance(output, (list, tuple)) and isinstance(
++            output_buffer, type(output)
++        ):
++            if len(output) != len(output_buffer):
++                raise ValueError(
++                    "BCG output sequence structure changed between capture sizes: "
++                    f"{len(output)} != {len(output_buffer)}"
++                )
++            for item, buffer in zip(output, output_buffer):
++                self._copy_output_to_buffer(item, buffer, num_tokens)
++            return
++        raise TypeError(
++            "Unsupported BCG output buffer pair: "
++            f"{type(output)} vs {type(output_buffer)}"
++        )
++
++    def replay_prepare(self, forward_batch, **kwargs):
++        return PiecewiseCudaGraphRunner.replay_prepare(self, forward_batch, **kwargs)
++
++    def replay(
++        self,
++        forward_batch: ForwardBatch,
++        **kwargs,
++    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
++        from sglang.srt.model_executor.prefill_cuda_graph import (
++            _increment_replay_diagnostic,
++        )
++
++        _increment_replay_diagnostic(self)
++        num_tokens = len(forward_batch.input_ids)
++        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
++        static_num_tokens = self.capture_num_tokens[index]
++
++        from sglang.srt.model_executor.prefill_cuda_graph import (
++            PrefillCudaGraphFactory,
++        )
++
++        shape_key = PrefillCudaGraphFactory.shape_identity(static_num_tokens)
++        captured_graph = self.graphs[shape_key]
++        captured_hidden = self.output_buffers[shape_key]
++
++        # Closure replaces layer_model.forward for the duration of the outer
++        # model.forward call. Replays the captured CUDAGraph and hands the
++        # outer forward the captured hidden_states; logits_processor / pooler
++        # then runs eagerly on top with the live multi-req forward_batch.
++        def replay_layer_forward(*args, **layer_kwargs):
++            ie = layer_kwargs.get("input_embeds") or (
++                args[self._input_embeds_arg_idx]
++                if self.use_input_embeds and len(args) > self._input_embeds_arg_idx
++                else None
++            )
++            if self.use_input_embeds:
++                if ie is None:
++                    raise ValueError("BCG replay expects input_embeds but got None")
++                self.buffers.input_embeds[:static_num_tokens].copy_(
++                    ie[:static_num_tokens]
++                )
++            else:
++                if ie is not None:
++                    raise ValueError(
++                        "BCG replay got unexpected input_embeds on non-multimodal model"
++                    )
++            captured_graph.replay()
++            return captured_hidden
++
++        with enable_breakable_cuda_graph():
++            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
++
++            original_layer_forward = self.layer_model.forward
++            self.layer_model.forward = replay_layer_forward
++            try:
++                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
++                with set_forward_context(
++                    static_forward_batch,
++                    self.attention_layers,
++                    self.quant_config,
++                    self.moe_layers,
++                    self.moe_fusions,
++                ):
++                    output = self.model_runner.model.forward(
++                        static_forward_batch.input_ids,
++                        static_forward_batch.positions,
++                        static_forward_batch,
++                        **kwargs,
++                    )
++            finally:
++                self.layer_model.forward = original_layer_forward
++        if isinstance(output, LogitsProcessorOutput):
++            return LogitsProcessorOutput(
++                next_token_logits=output.next_token_logits[: self.raw_num_tokens],
++                hidden_states=(
++                    output.hidden_states[: self.raw_num_tokens]
++                    if output.hidden_states is not None
++                    else None
++                ),
++            )
++        elif isinstance(output, EmbeddingPoolerOutput):
++            return output
++        else:
++            assert isinstance(output, PPProxyTensors)
++            raise NotImplementedError(
++                "PPProxyTensors is not supported in BreakableCudaGraphRunner."
++            )
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index b4e21bb3b..f518a43aa 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -359,7 +359,11 @@ is_capture_mode = False
+ 
+ 
+ def get_is_capture_mode():
+-    return is_capture_mode
++    from sglang.srt.model_executor.breakable_cuda_graph.context import (
++        is_in_breakable_cuda_graph,
++    )
++
++    return is_capture_mode or is_in_breakable_cuda_graph()
+ 
+ 
+ @contextmanager
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index efebc02e8..0e1493187 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -139,9 +139,7 @@ from sglang.srt.model_executor.hook_manager import register_forward_hooks
+ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+     ModelRunnerKVCacheMixin,
+ )
+-from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+-    PiecewiseCudaGraphRunner,
+-)
++from sglang.srt.model_executor.prefill_cuda_graph import PrefillCudaGraphFactory
+ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+ from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+@@ -2674,7 +2672,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
+         )
+ 
+-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
++        self.piecewise_cuda_graph_runner = PrefillCudaGraphFactory.create(self)
+ 
+         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+         mem_usage = before_mem - after_mem
+diff --git a/python/sglang/srt/model_executor/prefill_cuda_graph.py b/python/sglang/srt/model_executor/prefill_cuda_graph.py
+new file mode 100644
+index 000000000..248ddf6b7
+--- /dev/null
++++ b/python/sglang/srt/model_executor/prefill_cuda_graph.py
+@@ -0,0 +1,121 @@
++# Copyright 2023-2026 SGLang Team
++# Licensed under the Apache License, Version 2.0 (the "License");
++"""Stable construction and diagnostics for the breakable prefill graph engine."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Optional
++
++import torch
++
++
++@dataclass(frozen=True)
++class PrefillCudaGraphDiagnostics:
++    """Detached snapshot of observable engine state."""
++
++    backend: str
++    capture_active: bool
++    graph_count: int = 0
++    segment_count: int = 0
++    eager_break_count: int = 0
++    replay_count: int = 0
++    allocation_identity: Optional[int] = None
++    allocation_capacity: int = 0
++
++
++class PrefillCudaGraphFactory:
++    """Canonical constructor for the explicit breakable prefill engine."""
++
++    @staticmethod
++    def shape_identity(
++        size: int,
++        stream_idx: Optional[int] = None,
++        variant_label: Optional[str] = None,
++    ) -> Any:
++        from sglang.srt.model_executor.breakable_cuda_graph_runner import ShapeKey
++
++        return ShapeKey(size, stream_idx, variant_label)
++
++    @classmethod
++    def create(cls, model_runner: Any) -> Any:
++        from sglang.srt.model_executor.breakable_cuda_graph_runner import (
++            BreakableCudaGraphRunner,
++        )
++
++        runner = BreakableCudaGraphRunner(model_runner)
++        runner._prefill_cuda_graph_replay_count = 0
++        return runner
++
++
++def _first_tensor(value: Any) -> Optional[torch.Tensor]:
++    if torch.is_tensor(value):
++        return value
++    if isinstance(value, dict):
++        values = value.values()
++    elif isinstance(value, (tuple, list)):
++        values = value
++    elif hasattr(value, "tensors") and isinstance(value.tensors, dict):
++        values = value.tensors.values()
++    else:
++        return None
++    for item in values:
++        tensor = _first_tensor(item)
++        if tensor is not None:
++            return tensor
++    return None
++
++
++def get_prefill_cuda_graph_diagnostics(subject: Any) -> PrefillCudaGraphDiagnostics:
++    """Return an immutable snapshot for a production model or graph runner."""
++
++    graph_runner = getattr(subject, "piecewise_cuda_graph_runner", None)
++    if graph_runner is not None and graph_runner is not subject:
++        return get_prefill_cuda_graph_diagnostics(graph_runner)
++
++    graphs = getattr(subject, "graphs", None)
++    if graphs is None and hasattr(subject, "_segments"):
++        graph_values = [subject]
++    elif isinstance(graphs, dict):
++        graph_values = list(graphs.values())
++    else:
++        graph_values = []
++
++    segment_count = sum(len(getattr(graph, "_segments", ())) for graph in graph_values)
++    eager_break_count = sum(
++        len(getattr(graph, "_break_fns", ())) for graph in graph_values
++    )
++    shared = _first_tensor(getattr(subject, "shared_output_buffer", None))
++    if shared is None:
++        allocation_identity = None
++        allocation_capacity = 0
++    else:
++        storage = shared.untyped_storage()
++        allocation_identity = storage.data_ptr()
++        allocation_capacity = storage.nbytes()
++
++    try:
++        from sglang.srt.model_executor.breakable_cuda_graph.context import (
++            is_in_breakable_cuda_graph,
++        )
++
++        capture_active = is_in_breakable_cuda_graph()
++    except ImportError:
++        capture_active = False
++
++    return PrefillCudaGraphDiagnostics(
++        backend="breakable",
++        capture_active=capture_active,
++        graph_count=len(graph_values),
++        segment_count=segment_count,
++        eager_break_count=eager_break_count,
++        replay_count=getattr(subject, "_prefill_cuda_graph_replay_count", 0),
++        allocation_identity=allocation_identity,
++        allocation_capacity=allocation_capacity,
++    )
++
++
++def _increment_replay_diagnostic(subject: Any) -> None:
++    subject._prefill_cuda_graph_replay_count = (
++        getattr(subject, "_prefill_cuda_graph_replay_count", 0) + 1
++    )
