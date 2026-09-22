@@ -723,6 +723,12 @@ def _within(path: Path, root: Path) -> bool:
     return True
 
 
+def _view_link_is_internal(path: Path, repository: Path) -> bool:
+    """Check the immediate link destination without following the blob-store link."""
+    target = Path(os.path.abspath(path.parent.resolve() / os.readlink(path)))
+    return _within(target, repository)
+
+
 def _hardlink_view_path(source: Path, target: Path, preserve_symlinks: bool) -> None:
     """Materialize one self-contained view path without duplicating file bytes."""
     if source.is_file():
@@ -734,8 +740,8 @@ def _hardlink_view_path(source: Path, target: Path, preserve_symlinks: bool) -> 
     safe_root = source if preserve_symlinks else source.parents[1]
     # huggingface_hub >= 1.3 links blobs/<sha> into a store shared across repositories under the
     # hub cache (hub/blobs/<xx>/<sha>). A symlink may therefore leave the repository cache but
-    # must stay inside the hub cache; such entries are materialized by hardlink so the view stays
-    # self-contained (the container only sees the bind-mounted view).
+    # must stay inside the hub cache. Materialize those blob entries, but preserve snapshot links
+    # to repository-local blobs: task verifiers may identify weights by the blob's LFS hash name.
     hub_root = source.parent if preserve_symlinks else safe_root
     target.mkdir(parents=True, exist_ok=True)
     for path in source.rglob("*"):
@@ -751,7 +757,7 @@ def _hardlink_view_path(source: Path, target: Path, preserve_symlinks: bool) -> 
             if link.is_absolute():
                 raise CorruptAssetError(f"view source symlink is absolute: {path}")
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if preserve_symlinks and _within(resolved, safe_root):
+            if preserve_symlinks and _view_link_is_internal(path, safe_root):
                 destination.symlink_to(link)
             elif resolved.is_file():
                 os.link(resolved, destination)
@@ -800,7 +806,7 @@ def _validate_view(
         for path, preserve_symlink in current:
             candidate = target if source.is_file() else target / path.relative_to(source)
             try:
-                if preserve_symlink and candidate.is_symlink():
+                if preserve_symlink and _view_link_is_internal(path, source):
                     source_link = Path(os.readlink(path))
                     candidate_link = Path(os.readlink(candidate))
                     candidate_target = candidate.resolve(strict=True)
