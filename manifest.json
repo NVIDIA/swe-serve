@@ -22,7 +22,7 @@
   "scripts/configs/paper/kimi-k3.yaml": "4a037278c8e18f3a8c8c4869b11e419edea990aced7630adced0c2ab13ad6376",
   "scripts/configs/paper/laguna-s-2.1.yaml": "0dc62c6f9156b45efdb900bdfb290d02ab7b339a8e789b56aa564c28782c0a62",
   "scripts/gpu_env.py": "7993ef45f69ed46479dd323e553ad41ebe8b6fc1b8b4967179986a76e50e1565",
-  "scripts/preflight.py": "b4c565c8d9b0783f14ef2c5a85e73666a571bc3c1993094b5898ab44ae3aafb4",
+  "scripts/preflight.py": "149498cc75b43d14b7570481f80fc60d989a69cae04c9a90bf6bcea75cd798d1",
   "scripts/verify_manifest.py": "f5ffa770cd264454a5ac2c9a70d550d1bcd7a331c3c63dc30e21d9812f2e6ba5",
   "task_list.csv": "836729121183ee1d756047474476e67e07aeea1a7874a3d459d25e241f4d2db9",
   "tasks/ss-sgl-adaptive-allocation-safety/environment/Dockerfile": "9d81a17d4873d388ff1e2e73b44359d0056b96ca1cdbdf23c2b3189eb3e0f737",
