@@ -612,10 +612,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## pytest 8.3.5 (vendored wheel, unmodified)
+## pytest 9.0.3 (vendored wheel, unmodified)
 
-`pytest-8.3.5-py3-none-any.whl`; Author: Holger Krekel, Bruno Oliveira, Ronny Pfannschmidt, Floris Bruynooghe, Brianna Laugher, Florian Bruhin, Others (See AUTHORS), License: MIT.
-Present in 3 task directories (`tasks/ss-sgl-adaptive-allocation-safety/tests/vendor/pytest-8.3.5-py3-none-any.whl`, ...).
+`pytest-9.0.3-py3-none-any.whl`; Author: Holger Krekel, Bruno Oliveira, Ronny Pfannschmidt, Floris Bruynooghe, Brianna Laugher, Freya Bruhin, Others (See AUTHORS), License-Expression: MIT.
+Present in 3 task directories (`tasks/ss-sgl-adaptive-allocation-safety/tests/vendor/pytest-9.0.3-py3-none-any.whl`, ...).
 
 ```
 The MIT License (MIT)
